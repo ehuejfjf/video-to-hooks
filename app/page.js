@@ -1,7 +1,7 @@
 "use client";
 import { useState, useRef } from "react";
-
-const CHUNK_MB = 20 * 1024 * 1024;
+import { SAMPLE_RATE, mixToMono, floatTo16BitPcm, splitIntoWavChunks } from "../lib/wav.mjs";
+import { readJson } from "../lib/http.mjs";
 
 export default function Home() {
   const [videoFile, setVideoFile] = useState(null);
@@ -19,60 +19,32 @@ export default function Home() {
     if (f) { setVideoFile(f); setTranscript(""); setOutput(""); setError(""); setStatus(""); }
   };
 
+  // Decode the video's audio track and return it as uploadable WAV chunks,
+  // each a complete WAV file under the hosting request-size limit.
   async function extractAudio(file) {
     setStatus("Extracting audio from video...");
-    const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: 16000 });
-    const buf = await file.arrayBuffer();
-    const audioBuf = await ctx.decodeAudioData(buf);
-    const len = audioBuf.length;
-    const numCh = audioBuf.numberOfChannels;
-    const mono = new Float32Array(len);
-    for (let c = 0; c < numCh; c++) {
-      const ch = audioBuf.getChannelData(c);
-      for (let i = 0; i < len; i++) mono[i] += ch[i] / numCh;
+    const ctx = new (window.AudioContext || window.webkitAudioContext)({ sampleRate: SAMPLE_RATE });
+    try {
+      const audioBuf = await ctx.decodeAudioData(await file.arrayBuffer());
+      const channels = [];
+      for (let c = 0; c < audioBuf.numberOfChannels; c++) channels.push(audioBuf.getChannelData(c));
+      const pcm = floatTo16BitPcm(mixToMono(channels));
+      return splitIntoWavChunks(pcm, SAMPLE_RATE).map((buf) => new Blob([buf], { type: "audio/wav" }));
+    } catch (e) {
+      throw new Error("Could not read audio from this file. " + (e?.message || ""));
+    } finally {
+      ctx.close();
     }
-    const pcm = new Int16Array(len);
-    for (let i = 0; i < len; i++) {
-      const s = Math.max(-1, Math.min(1, mono[i]));
-      pcm[i] = s < 0 ? s * 0x8000 : s * 0x7FFF;
-    }
-    const wavBuf = new ArrayBuffer(44 + pcm.byteLength);
-    const v = new DataView(wavBuf);
-    const w = (o, s) => { for (let i = 0; i < s.length; i++) v.setUint8(o + i, s.charCodeAt(i)); };
-    w(0,"RIFF"); v.setUint32(4, 36 + pcm.byteLength, true); w(8,"WAVE");
-    w(12,"fmt "); v.setUint32(16,16,true); v.setUint16(20,1,true); v.setUint16(22,1,true);
-    v.setUint32(24,16000,true); v.setUint32(28,32000,true); v.setUint16(32,2,true); v.setUint16(34,16,true);
-    w(36,"data"); v.setUint32(40, pcm.byteLength, true);
-    new Int16Array(wavBuf, 44).set(pcm);
-    await ctx.close();
-    return new Blob([wavBuf], { type: "audio/wav" });
   }
 
-  function blobToBase64(blob) {
-    return new Promise((res, rej) => {
-      const r = new FileReader();
-      r.onload = () => res(r.result.split(",")[1]);
-      r.onerror = rej;
-      r.readAsDataURL(blob);
-    });
-  }
-
-  async function transcribeAudio(wav) {
-    const totalSize = wav.size;
-    const numChunks = Math.ceil(totalSize / CHUNK_MB);
+  async function transcribeAudio(chunks) {
     const parts = [];
-    for (let i = 0; i < numChunks; i++) {
-      setStatus(`Transcribing audio${numChunks > 1 ? ` (part ${i+1} of ${numChunks})` : ""}...`);
-      const chunk = wav.slice(i * CHUNK_MB, Math.min((i+1) * CHUNK_MB, totalSize), "audio/wav");
-      const b64 = await blobToBase64(chunk);
-      const res = await fetch("/api/transcribe", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ audio: b64 })
-      });
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
-      parts.push(data.transcript);
+    for (let i = 0; i < chunks.length; i++) {
+      setStatus(`Transcribing audio${chunks.length > 1 ? ` (part ${i + 1} of ${chunks.length})` : ""}...`);
+      const fd = new FormData();
+      fd.append("file", chunks[i], "audio.wav");
+      const data = await readJson(await fetch("/api/transcribe", { method: "POST", body: fd }));
+      if (data.transcript) parts.push(data.transcript);
     }
     return parts.join(" ");
   }
@@ -81,9 +53,9 @@ export default function Home() {
     if (!videoFile) return;
     setError(""); setOutput(""); setTranscript(""); setLoading(true);
     try {
-      const wav = await extractAudio(videoFile);
-      setStatus(`Audio ready (${(wav.size/1024/1024).toFixed(1)} MB). Transcribing...`);
-      const tx = await transcribeAudio(wav);
+      const chunks = await extractAudio(videoFile);
+      const tx = await transcribeAudio(chunks);
+      if (!tx.trim()) throw new Error("No speech was found in this video.");
       setTranscript(tx);
       setStatus("Generating hooks & caption...");
       const res = await fetch("/api/generate", {
@@ -91,8 +63,7 @@ export default function Home() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ transcript: tx })
       });
-      const data = await res.json();
-      if (data.error) throw new Error(data.error);
+      const data = await readJson(res);
       setOutput(data.result);
       setStatus("");
     } catch(e) {

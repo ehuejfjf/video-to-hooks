@@ -5,12 +5,16 @@
   "scripts": {
     "dev": "next dev",
     "build": "next build",
-    "start": "next start"
+    "start": "next start",
+    "test": "node --test"
   },
   "dependencies": {
-    "next": "15.3.1",
-    "@anthropic-ai/sdk": "^0.20.0",
+    "next": "15.5.28",
+    "@anthropic-ai/sdk": "^1.4.0",
     "react": "^19.1.0",
     "react-dom": "^19.1.0"
+  },
+  "engines": {
+    "node": ">=20"
   }
 }
