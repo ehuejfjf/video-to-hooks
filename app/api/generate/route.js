@@ -1,4 +1,7 @@
 import Anthropic from "@anthropic-ai/sdk";
+import { resultFromMessage } from "../../../lib/claude.mjs";
+
+export const maxDuration = 300;
 
 const SYSTEM_PROMPT = `You are analyzing a video transcript to create viral text hooks and an engaging caption for Melvin, a coach/consultant content creator. Your goal is to stop the scroll and make viewers want to watch the entire video.
 
@@ -21,7 +24,7 @@ Create 10 hooks using: Contradiction & Contrast, Hyper-Specificity, Timeframe Te
 Required CTA Block (verbatim at end):
 If we haven't met yet...
 
-My name is Melvin, I've help coaches, consultants, and service providers break through their scaling challenges and become undeniable market leaders, 
+My name is Melvin, I've helped coaches, consultants, and service providers break through their scaling challenges and become undeniable market leaders, 
 
 while generating over $100M in sales, and I've personally sold over $45M worth of programs myself.
 
@@ -73,16 +76,25 @@ Structure: Opening (2-4 short paragraphs, relatable, Melvin's voice) → Core Va
 
 export async function POST(req) {
   try {
+    if (!process.env.ANTHROPIC_API_KEY) {
+      return Response.json({ error: "ANTHROPIC_API_KEY is not set on the server." }, { status: 500 });
+    }
     const { transcript } = await req.json();
+    if (typeof transcript !== "string" || !transcript.trim()) {
+      return Response.json({ error: "The transcript is empty, so there is nothing to write hooks from." }, { status: 400 });
+    }
     const client = new Anthropic({ apiKey: process.env.ANTHROPIC_API_KEY });
-    const msg = await client.messages.create({
-      model: "claude-sonnet-4-20250514",
-      max_tokens: 1000,
+    const msg = await client.beta.messages.create({
+      model: "claude-sonnet-5-5",
+      max_tokens: 16000,
+      // If a safety classifier declines, retry on another model in the same call.
+      betas: ["server-side-fallback-2026-07-01"],
+      fallbacks: "default",
       system: SYSTEM_PROMPT,
       messages: [{ role: "user", content: "Here is the video transcript. Generate the hooks and caption now:\n\n" + transcript }]
     });
-    const text = msg.content.map(b => b.text || "").join("");
-    return Response.json({ result: text });
+    const out = resultFromMessage(msg);
+    return Response.json(out, { status: out.error ? 502 : 200 });
   } catch (e) {
     return Response.json({ error: e.message }, { status: 500 });
   }
