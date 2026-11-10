@@ -102,6 +102,27 @@ The default `--style podcast` was matched to the creator's reference reel (measu
   multi-cam podcast edit; pauses up to 0.45 s are kept natural, longer ones cut.
 - Audio normalised to −11 LUFS (loud, like the reference).
 
+`--style cards` is the "explainer" look (matched to the Gratias reference): lowercase Poppins
+captions (1–2 lines, brands/acronyms keep their case) plus full-screen **grid-paper cards** that
+build key phrases word by word as they're spoken, with orange bold-italic emphasis. Captions
+hide during text cards. Write a `cards.json` next to the video and pass `--cards cards.json`:
+
+```json
+[
+ {"at": "w96-110",  "text": ["Not *stuck*", "# Stacked"]},
+ {"at": "w139-163", "text": ["# Stacked:", "burdened by", "so many things", "in your *life*", "your *head*", "your *heart*"]},
+ {"at": "w60-70",   "image": "ron_kaufman.jpg", "label": "Ron Kaufman"}
+]
+```
+
+- `at`: the words (or `L<line>`) the card covers; the speaker's audio keeps playing.
+- `# ` makes a big orange header line; `*word*` = orange bold-italic emphasis.
+- Start each line with a word that is actually spoken so it appears in sync (otherwise lines
+  appear evenly). Keep lines ≤ 22 characters.
+- Use cards for definitions, numbered points, quotes and punchlines — about one per 10–15 s,
+  1.5–8 s each. Photo cards (person/logo/screenshot) need an image from the user; never pull
+  photos of people from the web.
+
 `--style bold` gives the alternative Hormozi look (UPPERCASE, yellow word highlight, higher captions, −14 LUFS).
 
 Optional extras (use them when the user provides the info/files):
