@@ -872,7 +872,7 @@ def parse_broll(spec, timed, lines):
 def cmd_render(a):
     need("ffmpeg")
     apply_style(a)
-    for k in ("end_image", "end_logo"):
+    for k in ("end_image", "end_logo", "card_bg"):
         v = getattr(a, k)
         if v:
             v = os.path.abspath(os.path.expanduser(v))
@@ -948,13 +948,25 @@ def cmd_render(a):
         last = f"[o{k}]"
     # cards: grid background over everything (incl. b-roll), photos on top, text via ASS
     if cards:
-        bg = make_grid_bg(os.path.join(wd, "card_bg.png"))
-        idx = inputs.count("-i")
-        inputs += ["-loop", "1", "-framerate", str(FPS), "-i", bg]
-        win = "+".join(f"between(t,{cd['s']:.3f},{cd['e']:.3f})" for cd in cards)
-        fc.append(f"[{idx}:v]format=yuv420p,setsar=1[cbg]")
-        fc.append(f"{last}[cbg]overlay=shortest=1:enable='{win}'[cardbg]")
-        last = "[cardbg]"
+        # background per card: card["bg"] > --card-bg > generated grid paper. Video bgs loop.
+        default_bg = a.card_bg or make_grid_bg(os.path.join(wd, "card_bg.png"))
+        groups = {}
+        for cd in cards:
+            bgp = os.path.abspath(os.path.expanduser(cd.get("bg") or default_bg))
+            if not os.path.exists(bgp):
+                die(f"card background not found: {bgp}")
+            groups.setdefault(bgp, []).append(cd)
+        for g, (bgp, cds) in enumerate(groups.items()):
+            idx = inputs.count("-i")
+            if bgp.lower().endswith((".mp4", ".mov", ".m4v", ".webm", ".mkv")):
+                inputs += ["-stream_loop", "-1", "-i", bgp]
+            else:
+                inputs += ["-loop", "1", "-framerate", str(FPS), "-i", bgp]
+            win = "+".join(f"between(t,{cd['s']:.3f},{cd['e']:.3f})" for cd in cds)
+            fc.append(f"[{idx}:v]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
+                      f"fps={FPS},format=yuv420p,setsar=1[cbg{g}]")
+            fc.append(f"{last}[cbg{g}]overlay=shortest=1:enable='{win}'[cardbg{g}]")
+            last = f"[cardbg{g}]"
         for k, cd in enumerate(c for c in cards if c.get("image")):
             idx = inputs.count("-i")
             inputs += ["-loop", "1", "-framerate", str(FPS), "-i", cd["image"]]
@@ -1111,6 +1123,7 @@ def main():
         sp.add_argument("--lower-start", type=float, default=4.0)
         sp.add_argument("--lower-duration", type=float, default=4.0)
         sp.add_argument("--lower-y", type=int, default=1335)
+        sp.add_argument("--card-bg", default="", help="background for cards: image or (looping) video")
         sp.add_argument("--cards", default="", help="cards.json with full-screen text/photo cards (see SKILL.md)")
         sp.add_argument("--broll", default="", help="cutaways: w60-65=gym.mp4,L4=seminar.mov@1.5 (@ = start offset in the clip)")
         sp.add_argument("--end-heading", default="", help='end card heading, e.g. "Full Episode:"')

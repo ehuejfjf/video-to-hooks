@@ -115,6 +115,14 @@ hide during text cards. Write a `cards.json` next to the video and pass `--cards
 ]
 ```
 
+- **Background:** `--card-bg grid.mp4` (looping video or image) for all cards, or `"bg": "file"`
+  per card. Without it a grid-paper image is generated. The creator's motion-grid library is in
+  Google Drive folder `1jcOw3HCBwgfUTw6N1GvEIRAna5b388d2` (download with
+  `curl -L "https://drive.usercontent.google.com/download?id=<FILE_ID>&export=download&confirm=t"`):
+  **"9 White Grid.mp4" (id `1oZH48_XclfGihyuOaJLLD55J4FOcHTNi`) is the house default** — the exact
+  look of the reference. Others: 1 Cool Grey, 2 Baby Blue, 4 Superman (blue/red), 5 Tiffany,
+  6 Purple, 7 Dark Red, 8 Dark Blue, 11 White Motion (graph paper), 18 Black Motion. Ignore
+  files starting with `._` (macOS junk).
 - `at`: the words (or `L<line>`) the card covers; the speaker's audio keeps playing.
 - `# ` makes a big orange header line; `*word*` = orange bold-italic emphasis.
 - Start each line with a word that is actually spoken so it appears in sync (otherwise lines
