@@ -209,6 +209,19 @@ def parse_drop(spec, lines, nwords):
     return drop
 
 
+def audio_envelope(video):
+    """10 ms RMS loudness (dBFS) of the source audio + its noise floor."""
+    import numpy as np
+    pcm = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-i", video, "-vn", "-ac", "1",
+                          "-ar", "16000", "-f", "f32le", "-"], capture_output=True).stdout
+    x = np.frombuffer(pcm, np.float32)
+    n = len(x) // 160
+    fr = x[: n * 160].reshape(n, 160)
+    env = 20 * np.log10(np.sqrt((fr ** 2).mean(axis=1)) + 1e-9)
+    floor = float(np.percentile(env, 10))
+    return env.tolist(), floor
+
+
 def detect_silences(video, noise_db, min_d):
     p = subprocess.run(["ffmpeg", "-hide_banner", "-nostats", "-i", video, "-vn", "-af",
                         f"silencedetect=noise={noise_db}dB:d={min_d}", "-f", "null", "-"],
@@ -240,13 +253,53 @@ def cmd_plan(a):
     if not keep:
         die("everything was dropped")
 
-    sil = detect_silences(data["source"], a.noise_db, 0.12)
+    env, floor = audio_envelope(data["source"])
+    quiet = min(floor + 9.0, -34.0)
 
-    def in_silence(t):
-        for s, e in sil:
-            if s <= t <= e:
-                return (s, e)
-        return None
+    def db_at(t):
+        i = int(t * 100)
+        return env[i] if 0 <= i < len(env) else -90.0
+
+    def quiet_run(t, n, step):
+        return all(db_at(t + k * step) < quiet for k in range(n))
+
+    def snap_end(last, nxt):
+        """Cut-out point: just after the last kept word, inside a real pause (>=100 ms of quiet)."""
+        lo = last["e"] - 0.06
+        hi = last["e"] + 0.45
+        if nxt is not None:
+            hi = min(hi, nxt["s"] + 0.02)
+        hi = max(hi, lo + 0.02)
+        t = lo
+        while t <= hi:
+            if quiet_run(t, 10, 0.01):
+                return t + 0.06  # keep a little tail so final consonants aren't clipped
+            t += 0.01
+        t = lo  # no full pause: first 60 ms of quiet, else the quietest point
+        while t <= hi:
+            if quiet_run(t, 6, 0.01):
+                return t + 0.04
+            t += 0.01
+        cand = [lo + k * 0.01 for k in range(int((hi - lo) / 0.01) + 1)]
+        return min(cand, key=db_at) + 0.01
+
+    def snap_start(first, prv):
+        """Cut-in point: before the real onset of the first kept word. Whisper start times are often
+        late (soft consonants), so look up to 0.6 s back for a real pause (>=150 ms of quiet)."""
+        hi = first["s"] + 0.04
+        lo = first["s"] - 0.6
+        if prv is not None:
+            lo = max(lo, prv["e"] + 0.01)
+        lo = min(lo, hi - 0.02)
+        t = hi
+        while t >= lo:
+            if quiet_run(t, 15, -0.01) or (t - 0.15 < lo and quiet_run(t, 6, -0.01)):
+                return t - 0.04
+            t -= 0.01
+        if db_at(lo) < quiet + 6:
+            return lo
+        cand = [lo + k * 0.01 for k in range(int((hi - lo) / 0.01) + 1)]
+        return min(cand, key=db_at)
 
     # Group kept words into continuous runs. A run breaks at a dropped word or a long pause.
     runs, cur = [], [keep[0]]
@@ -264,20 +317,13 @@ def cmd_plan(a):
         first, last = r[0], r[-1]
         prev_any = words[first["i"] - 1] if first["i"] > 0 else None
         next_any = words[last["i"] + 1] if last["i"] + 1 < len(words) else None
-        s = first["s"] - a.pad_in
-        e = last["e"] + a.pad_out
-        # Whisper often stretches a word's end into the following silence: pull it back.
-        z = in_silence(last["e"])
-        if z and z[0] + a.pad_out < e:
-            e = max(last["s"] + 0.08, z[0] + a.pad_out)
-        z = in_silence(first["s"])
-        if z and z[1] - a.pad_in > s:
-            s = min(first["e"] - 0.08, z[1] - a.pad_in)
-        # Never bleed into the neighbouring (possibly dropped) word.
+        s = snap_start(first, prev_any) - (a.pad_in - 0.06)
+        e = snap_end(last, next_any) + (a.pad_out - 0.12)
+        # Never reach deep into a neighbouring (dropped) word.
         if prev_any:
-            s = max(s, prev_any["e"] + 0.01)
+            s = max(s, prev_any["e"] - 0.02)
         if next_any:
-            e = min(e, next_any["s"] - 0.01)
+            e = min(e, next_any["s"] + 0.06)
         s, e = max(0.0, s), min(dur, e)
         if e - s < 0.12:
             continue
