@@ -677,7 +677,7 @@ def make_endcard(a, wd, out):
 
 
 def parse_broll(spec, timed, lines):
-    """'w60-65=gym.mp4,L4=seminar.mov' -> [(out_start, out_end, path)]"""
+    """'w60-65=gym.mp4,L4=seminar.mov@1.5' -> [(out_start, out_end, path, clip_offset)]"""
     out = []
     if not spec:
         return out
@@ -686,7 +686,13 @@ def parse_broll(spec, timed, lines):
         if "=" not in item:
             die(f"b-roll item '{item}' needs RANGE=FILE")
         rng, path = item.split("=", 1)
-        rng, path = rng.strip(), os.path.expanduser(path.strip())
+        rng, path = rng.strip(), path.strip()
+        offset = 0.0
+        m_off = re.search(r"@([\d.]+)$", path)
+        if m_off:
+            offset = float(m_off.group(1))
+            path = path[:m_off.start()]
+        path = os.path.expanduser(path)
         if not os.path.exists(path):
             die(f"b-roll file not found: {path}")
         m = re.fullmatch(r"[Ll](\d+)", rng)
@@ -701,7 +707,7 @@ def parse_broll(spec, timed, lines):
         kept = [by_i[i] for i in range(w1, w2 + 1) if i in by_i]
         if not kept:
             die(f"b-roll range {rng} covers no kept words")
-        out.append((kept[0]["s"], kept[-1]["e"], os.path.abspath(path)))
+        out.append((kept[0]["s"], kept[-1]["e"], os.path.abspath(path), offset))
     return out
 
 
@@ -774,10 +780,10 @@ def cmd_render(a):
 
     # b-roll: full-frame cutaways over chosen words; speaker audio continues underneath.
     inputs, fc, last = ["-i", joined], [], "[0:v]"
-    for k, (s0, s1, path) in enumerate(parse_broll(a.broll, timed, data["lines"])):
+    for k, (s0, s1, path, off) in enumerate(parse_broll(a.broll, timed, data["lines"])):
         inputs += ["-i", path]
         dur_b = s1 - s0 + 0.1
-        fc.append(f"[{k + 1}:v]trim=0:{dur_b:.3f},setpts=PTS-STARTPTS+{s0:.3f}/TB,"
+        fc.append(f"[{k + 1}:v]trim={off:.3f}:{off + dur_b:.3f},setpts=PTS-STARTPTS+{s0:.3f}/TB,"
                   f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps={FPS}[b{k}]")
         fc.append(f"{last}[b{k}]overlay=eof_action=pass:enable='between(t,{s0:.3f},{s1 + 0.05:.3f})'[o{k}]")
         last = f"[o{k}]"
@@ -899,7 +905,7 @@ def main():
         sp.add_argument("--lower-start", type=float, default=4.0)
         sp.add_argument("--lower-duration", type=float, default=4.0)
         sp.add_argument("--lower-y", type=int, default=1335)
-        sp.add_argument("--broll", default="", help="cutaways: w60-65=gym.mp4,L4=seminar.mov")
+        sp.add_argument("--broll", default="", help="cutaways: w60-65=gym.mp4,L4=seminar.mov@1.5 (@ = start offset in the clip)")
         sp.add_argument("--end-heading", default="", help='end card heading, e.g. "Full Episode:"')
         sp.add_argument("--end-handle", default="")
         sp.add_argument("--end-text", default="", help="end card title text")
