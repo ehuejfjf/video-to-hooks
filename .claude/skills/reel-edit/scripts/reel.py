@@ -427,17 +427,18 @@ def measure_text(text, font, size, bold=True):
     import numpy as np
     style = (f"Style: A,{font},{size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,{-1 if bold else 0},"
              f"0,0,0,100,100,0,0,1,0,0,5,0,0,0,1")
-    body = "\n".join(ass_header([style]) + [
-        f"Dialogue: 0,0:00:00.00,0:00:01.00,A,,0,0,0,,{{\\an5\\pos({W // 2},{H // 2})\\q2}}{ass_escape(text)}"])
+    MW = 4000  # wide canvas so text wider than the frame is measured, not clipped
+    body = "\n".join(ass_header([style], MW) + [
+        f"Dialogue: 0,0:00:00.00,0:00:01.00,A,,0,0,0,,{{\\an5\\pos({MW // 2},{H // 2})\\q2}}{ass_escape(text)}"])
     with tempfile.TemporaryDirectory() as td:
         with open(os.path.join(td, "m.ass"), "w", encoding="utf-8") as f:
             f.write(body + "\n")
         fonts = f":fontsdir={FONTS_DIR}" if os.path.isdir(FONTS_DIR) else ""
-        raw = subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", f"color=black:s={W}x{H}:d=0.1",
+        raw = subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", f"color=black:s={MW}x{H}:d=0.1",
                               "-vf", f"ass=m.ass{fonts}", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
                              capture_output=True, cwd=td).stdout
     try:
-        img = np.frombuffer(raw, np.uint8).reshape(H, W)
+        img = np.frombuffer(raw, np.uint8).reshape(H, MW)
         xs = np.where(img.max(0) > 100)[0]
         ys = np.where(img.max(1) > 100)[0]
         res = (int(xs[-1] - xs[0]), int(ys[-1] - ys[0]))
@@ -464,9 +465,9 @@ def split_two(text):
     return [" ".join(ws[:best]), " ".join(ws[best:])]
 
 
-def ass_header(styles):
+def ass_header(styles, play_w=None):
     return [
-        "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {W}", f"PlayResY: {H}",
+        "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {play_w or W}", f"PlayResY: {H}",
         "WrapStyle: 0", "ScaledBorderAndShadow: yes", "",
         "[V4+ Styles]",
         "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
@@ -488,6 +489,10 @@ def timed_words(words, edl):
             w = words[i]
             s = off + max(0.0, w["s"] - sg["start"])
             e = off + min(sg["end"] - sg["start"], w["e"] - sg["start"])
+            if timed and w["w"].startswith("-") and len(w["w"]) > 1:
+                timed[-1]["w"] += w["w"]
+                timed[-1]["e"] = max(timed[-1]["e"], e)
+                continue
             timed.append({"i": i, "w": w["w"], "s": s, "e": max(e, s + 0.06)})
         off += sg["end"] - sg["start"]
     return timed, off
