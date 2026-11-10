@@ -859,7 +859,7 @@ def build_ass(timed, total, a, out_path, cards=()):
             for s0, s1 in text_cards:
                 if cs < s0 < end:
                     end = s0
-            cap_y = a.caption_y
+            cap_y = a.cap_y_at(cs) if hasattr(a, "cap_y_at") else a.caption_y
             if any(s0 <= cs < s1 for s0, s1 in img_cards) and cap_y < 1150:
                 cap_y = 1170  # keep captions under the photo
             texts = []
@@ -967,13 +967,51 @@ def build_ass(timed, total, a, out_path, cards=()):
         f.write("\n".join(lines) + "\n")
 
 
-def fit_filter(zoom, mode, anchor):
+def fit_filter(zoom, mode, anchor, crop_y=None):
     if mode == "pad":
         return (f"split[a][b];[a]scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},"
                 f"boxblur=25:2,eq=brightness=-0.08[bg];[b]scale={W}:-2[fg];[bg][fg]overlay=(W-w)/2:(H-h)/2")
     cw = "min(iw,ih*9/16)"
     return (f"crop=w='trunc({cw}/{zoom}/2)*2':h='trunc({cw}*16/9/{zoom}/2)*2':"
-            f"x='(iw-ow)/2':y='(ih-oh)*{anchor}',scale={W}:{H}:flags=lanczos,setsar=1")
+            f"x='(iw-ow)/2':y='{crop_y if crop_y is not None else f'(ih-oh)*{anchor}'}',"
+            f"scale={W}:{H}:flags=lanczos,setsar=1")
+
+
+FACE_MODEL = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "models", "yunet.onnx"))
+
+
+def detect_chins(src, segs, info):
+    """Lowest chin y (source pixels, after rotation) per shot, via OpenCV YuNet. None if unavailable."""
+    try:
+        import cv2
+        import numpy as np
+    except ImportError:
+        print("note: opencv not installed — captions use a fixed height (pip install opencv-python-headless)")
+        return None
+    if not os.path.exists(FACE_MODEL) or not hasattr(cv2, "FaceDetectorYN"):
+        return None
+    sw = 540
+    scale = info["width"] / sw
+    sh = int(round(info["height"] / scale / 2) * 2)
+    det = cv2.FaceDetectorYN.create(FACE_MODEL, "", (sw, sh), 0.6)
+    chins = []
+    for sg in segs:
+        d = sg["end"] - sg["start"]
+        lows = []
+        for frac in (0.15, 0.5, 0.85):
+            t = sg["start"] + d * frac
+            raw = subprocess.run(["ffmpeg", "-loglevel", "error", "-ss", f"{t:.3f}", "-i", src, "-frames:v", "1",
+                                  "-vf", f"scale={sw}:{sh}", "-f", "rawvideo", "-pix_fmt", "bgr24", "-"],
+                                 capture_output=True).stdout
+            if len(raw) != sw * sh * 3:
+                continue
+            img = np.frombuffer(raw, np.uint8).reshape(sh, sw, 3).copy()
+            _, faces = det.detect(img)
+            if faces is not None and len(faces):
+                f = max(faces, key=lambda r: r[2] * r[3])
+                lows.append(float((f[1] + f[3] * 1.05) * scale))  # bottom of the box ≈ chin
+        chins.append(max(lows) if lows else None)
+    return chins
 
 
 def snap(t):
@@ -1101,6 +1139,34 @@ def cmd_render(a):
     listing = []
     segs = edl["segments"]
     n = len(segs)
+    # Face-aware framing: crop each zoomed shot so the chin sits above the caption line, then put
+    # captions at one consistent height just below the lowest chin.
+    chin_target = a.caption_y - 95
+    chins = detect_chins(src, segs, info) if (mode == "crop" and not a.no_face) else None
+    if chins:
+        known = [c for c in chins if c is not None]
+        fill = sorted(known)[len(known) // 2] if known else None
+        iw, ih = info["width"], info["height"]
+        cw = min(iw, ih * 9 / 16)
+        caps = []
+        for sg, chin in zip(segs, chins):
+            chin = chin if chin is not None else fill
+            z = sg.get("zoom", 1.0)
+            oh = int(cw * 16 / 9 / z) // 2 * 2
+            if chin is None:
+                sg["crop_y"], sg["chin_out"] = None, None
+                continue
+            y_off = chin - chin_target * oh / H
+            y_off = int(max(0, min(ih - oh, y_off)))
+            sg["crop_y"] = y_off
+            sg["chin_out"] = round(float((chin - y_off) * H / oh), 1)
+            caps.append(sg["chin_out"] + 95)
+        if caps:
+            base = max(a.caption_y, sorted(caps)[int(len(caps) * 0.8) - 1 if len(caps) > 1 else 0])
+            for sg in segs:
+                c = sg.get("chin_out")
+                sg["cap_y"] = int(min(1320, max(base, c + 95 if c else base)))
+            print(f"  face-aware framing: captions at y≈{int(base)} (chin always above)")
     for k, sg in enumerate(segs):
         d = sg["end"] - sg["start"]
         out = os.path.join(segdir, f"s{k:04d}.mkv")
@@ -1110,7 +1176,8 @@ def cmd_render(a):
             fades.append(f"afade=t=in:d={fade:.3f}")
         if not (k + 1 < n and segs[k + 1].get("join_prev")):
             fades.append(f"afade=t=out:st={d - fade:.3f}:d={fade:.3f}")
-        vf = fit_filter(sg.get("zoom", 1.0) if mode == "crop" else 1.0, mode, a.anchor) + f",fps={FPS},format=yuv420p"
+        vf = fit_filter(sg.get("zoom", 1.0) if mode == "crop" else 1.0, mode, a.anchor,
+                        sg.get("crop_y")) + f",fps={FPS},format=yuv420p"
         af = ",".join(["aresample=48000", "aformat=channel_layouts=stereo", *fades])
         run(["ffmpeg", "-y", "-hide_banner", "-ss", f"{sg['start']:.4f}", "-i", src, "-t", f"{d:.4f}",
              "-filter_complex", f"[0:v]{vf}[v];[0:a]{af}[a]", "-map", "[v]", "-map", "[a]",
@@ -1136,6 +1203,38 @@ def cmd_render(a):
             die(f"--emph items look like w23=serif / w40=bold / w55=circle, got {item!r}")
         a.emph_map[int(m.group(1))] = m.group(2)
     cards = parse_cards(a.cards, timed, data["lines"])
+    # shot boundaries on the output timeline
+    bounds, off = [0.0], 0.0
+    shot_win = []
+    for sg in segs:
+        d = sg["end"] - sg["start"]
+        shot_win.append((off, off + d, sg.get("cap_y", a.caption_y)))
+        off += d
+        bounds.append(off)
+
+    def snap_window(s0, s1):
+        """Start overlays on a shot boundary if one is just before, end them on one just after, so a
+        zoom change / jump never flashes for a split second next to a card or b-roll."""
+        before = [b for b in bounds if s0 - 0.8 <= b <= s0 + 0.05]
+        after = [b for b in bounds if s1 - 0.05 <= b <= s1 + 0.6]
+        return (max(before) if before else s0), (min(after) if after else s1)
+
+    for cd in cards:
+        cd["s"], cd["e"] = snap_window(cd["s"], cd["e"])
+    brolls = [(*snap_window(s0, s1), p_, o_) for s0, s1, p_, o_ in parse_broll(a.broll, timed, data["lines"])]
+    # Close tiny gaps between overlays: never flash the speaker for a split second between two of them.
+    items = [("c", i, cd["s"], cd["e"]) for i, cd in enumerate(cards)] + \
+            [("b", i, b[0], b[1]) for i, b in enumerate(brolls)]
+    items.sort(key=lambda x: x[2])
+    for cur, nxt in zip(items, items[1:]):
+        gap = nxt[2] - cur[3]
+        if 0 < gap < 0.6:
+            if cur[0] == "c":
+                cards[cur[1]]["e"] = nxt[2]
+            else:
+                b = brolls[cur[1]]
+                brolls[cur[1]] = (b[0], nxt[2], b[2], b[3])
+    a.cap_y_at = lambda t: next((cy for s0, s1, cy in shot_win if s0 <= t < s1), a.caption_y)
     build_ass(timed, total, a, os.path.join(wd, "captions.ass"), cards)
     name = os.path.splitext(os.path.basename(src))[0]
     final = a.out or os.path.join(os.path.dirname(wd), f"{name}_reel.mp4")
@@ -1143,7 +1242,7 @@ def cmd_render(a):
 
     # b-roll: full-frame cutaways over chosen words; speaker audio continues underneath.
     inputs, fc, last = ["-i", joined], [], "[0:v]"
-    for k, (s0, s1, path, off) in enumerate(parse_broll(a.broll, timed, data["lines"])):
+    for k, (s0, s1, path, off) in enumerate(brolls):
         inputs += ["-i", path]
         dur_b = s1 - s0 + 0.1
         fc.append(f"[{k + 1}:v]trim={off:.3f}:{off + dur_b:.3f},setpts=PTS-STARTPTS+{s0:.3f}/TB,"
@@ -1338,6 +1437,7 @@ def main():
         sp.add_argument("--lower-start", type=float, default=4.0)
         sp.add_argument("--lower-duration", type=float, default=4.0)
         sp.add_argument("--lower-y", type=int, default=1335)
+        sp.add_argument("--no-face", action="store_true", help="disable face-aware framing/captions")
         sp.add_argument("--emph", default="", help="promo captions: w23=serif,w40=bold,w55=circle")
         sp.add_argument("--split-crop-y", type=int, default=150, help="split cards: top of the speaker crop")
         sp.add_argument("--card-bg", default="", help="background for cards: image or (looping) video")

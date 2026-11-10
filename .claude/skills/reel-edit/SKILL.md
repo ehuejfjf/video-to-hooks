@@ -164,6 +164,13 @@ Optional extras (use them when the user provides the info/files):
 | `--hook-duration 3` `--hook ""` `--no-captions` | timing / off-switches |
 | `--out path.mp4` | custom output name |
 
+**Automatic clean-up at render time:** with `opencv-python-headless` installed (optional, free),
+each shot's face is detected (bundled YuNet model) and zoomed shots are cropped so the chin sits
+above the caption line; captions go at one height just below the lowest chin (`--no-face` turns it
+off). Cards and b-roll snap to shot boundaries (no zoom/jump a split second before or after them)
+and gaps < 0.6 s between overlays are closed. When the speaker's line doesn't make sense in short
+form, put the full sentence on the card — captions are hidden during cards.
+
 ## 5. Check your work visually (required)
 
 ```bash
