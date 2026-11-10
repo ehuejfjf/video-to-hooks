@@ -119,8 +119,15 @@ def cmd_transcribe(a):
     except Exception as e:  # noqa: BLE001
         die(f"couldn't load/download Whisper model '{a.model}' ({type(e).__name__}: {e}). "
             "The first run needs internet access to huggingface.co; after that it works offline.")
+    # Decode with ffmpeg ourselves: faster-whisper's PyAV decoder breaks on some PyAV versions.
+    import numpy as np
+    pcm = subprocess.run(["ffmpeg", "-nostdin", "-loglevel", "error", "-i", a.video, "-vn", "-ac", "1",
+                          "-ar", "16000", "-f", "f32le", "-"], capture_output=True)
+    if pcm.returncode != 0:
+        die("ffmpeg could not decode the audio: " + pcm.stderr.decode(errors="ignore")[-500:])
+    audio = np.frombuffer(pcm.stdout, dtype=np.float32)
     segs, tinfo = model.transcribe(
-        a.video,
+        audio,
         language=a.language,
         word_timestamps=True,
         initial_prompt=FILLER_PROMPT if a.keep_fillers_prompt else None,
