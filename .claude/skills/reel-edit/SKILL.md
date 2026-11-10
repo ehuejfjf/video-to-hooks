@@ -127,6 +127,9 @@ hide during text cards. Write a `cards.json` next to the video and pass `--cards
 - `# ` makes a big orange header line; `*word*` = orange bold-italic emphasis.
 - Start each line with a word that is actually spoken so it appears in sync (otherwise lines
   appear evenly). Keep lines ≤ 22 characters.
+- The cards style still gets **b-roll** exactly like the podcast style (tone-matched cutaways,
+  ~1 per 10–15 s, placed between cards) and **one-line captions** during talking head and b-roll.
+  Card lines are stacked tightly (small gap, never touching).
 - Use cards for definitions, numbered points, quotes and punchlines — about one per 10–15 s,
   1.5–8 s each. Photo cards (person/logo/screenshot) need an image from the user; never pull
   photos of people from the web.

@@ -365,7 +365,7 @@ STYLES = {
     # "cards": matched to the Gratias reference — lowercase Poppins captions, full-screen
     # grid-paper text/photo cards with orange bold-italic emphasis.
     "cards": dict(font="Poppins SemiBold", caption_size=100, caption_y=1170, uppercase=False, lowercase=True,
-                  highlight="none", words_per_caption=4, max_caption_chars=30, strip_punct=True,
+                  highlight="none", words_per_caption=3, max_caption_chars=18, strip_punct=True,
                   caption_box=False, hook_size=108, hook_y=234, hook_duration=3.8, hook_style="boxed",
                   lufs=-14.0, accent="#F7B500"),
     "bold": dict(font=None, caption_size=80, caption_y=1130, uppercase=True, highlight="#FFE600",
@@ -596,7 +596,12 @@ def card_events(cards, a):
         rows = c.get("text") or []
         heights = []
         for r in rows:
-            heights.append(size * (2.1 if r.startswith("# ") else 1.22))
+            if r.startswith("# "):
+                heights.append(size * 1.3)
+            elif "*" in r:
+                heights.append(size * 0.82)
+            else:
+                heights.append(size * 0.76)
         y = 1000 - sum(heights) / 2
         # reveal each line when its first word is spoken (fallback: evenly)
         spoken = [(norm(w["w"]), w["s"]) for w in c["words"]]
@@ -707,7 +712,7 @@ def build_ass(timed, total, a, out_path, cards=()):
             pos = f"\\an5\\pos({cx},{cap_y})"
             if a.style in ("podcast", "cards"):
                 lines.append(f"Dialogue: 1,{ass_time(c[0]['s'])},{ass_time(end)},Cap,,0,0,0,,"
-                             f"{{{pos}\\blur3}}" + " ".join(texts))
+                             f"{{{pos}\\q2\\blur3}}" + " ".join(texts))
                 continue
             for j in range(len(c)):
                 s = c[0]["s"] if j == 0 else c[j]["s"]
