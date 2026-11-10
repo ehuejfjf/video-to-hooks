@@ -1,1 +1,2 @@
-Drop .ttf/.otf files here (e.g. Montserrat ExtraBold from Google Fonts) and pass --font "Font Name".
+Montserrat (SIL Open Font License, see OFL.txt) is bundled and used by the default podcast style.
+Drop extra .ttf/.otf files here and pass --font "Font Name" to use them.

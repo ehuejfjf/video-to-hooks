@@ -60,9 +60,9 @@ python3 SKILL_DIR/scripts/reel.py plan "VIDEO" --drop "L1,L4-L5,w120-126"
 ```
 
 `--drop` accepts lines (`L3`, `L3-L6`) and word ranges (`w40-52`); look up exact word indices in
-`words.json` when you need partial lines. Pacing knobs: `--max-pause 0.30` (pauses longer than
-this are cut; use 0.2 for very punchy, 0.45 for calmer), `--zooms 1.0,1.12` (punch-in cycle
-applied per cut — hides jump cuts; `1.0` disables), `--keep-fillers`.
+`words.json` when you need partial lines. Pacing knobs: `--max-pause 0.45` (pauses longer than
+this are cut; 0.3 = punchier), `--max-shot 3` (zoom change at least every N s; 0 = off), `--zooms 1.0,1.15` (punch-in cycle
+applied per shot — hides jump cuts; `1.0` disables), `--keep-fillers`.
 
 Read the generated `edit.txt` (each kept segment with its text and duration) and check that the
 story reads cleanly start to finish. Re-run `plan` with a different `--drop` until it does.
@@ -73,27 +73,39 @@ Follow `SKILL_DIR/reference/hooks-and-caption.md` (the creator's house prompt) a
 result to `<video-name>_reel/hooks.md`: 10 text hooks, top 3 with reasoning, and the IG caption.
 Base everything on what's actually said in the KEPT transcript.
 
-Pick the strongest hook for the on-screen title: ≤ 10 words, readable in under 2 seconds.
+Pick the on-screen hook. **House style (podcast):** a short, striking *direct quote* from the
+speaker, in curly quotes and Title Case, split over two lines with `|` — line 1 renders white,
+line 2 gold. Example from the reference reel: `“I Can Only Ask | For Help If I Pay”`.
+Aim for 3–5 words per line (it auto-shrinks if long).
 
 ## 4. Render
 
 ```bash
-python3 SKILL_DIR/scripts/reel.py render "VIDEO" --hook "Your best hook here"
+python3 SKILL_DIR/scripts/reel.py render "VIDEO" --hook "“I Can Only Ask | For Help If I Pay”"
 ```
 
-Defaults are tuned for Instagram: 1080x1920 @30fps, H.264 + AAC, −14 LUFS, captions centred at
-y=1130 (above the bottom 35% IG covers with UI), hook title at the top for 3 s, word-by-word
-yellow highlight, 1–3 words per caption, uppercase. Useful flags:
+The default `--style podcast` was matched to the creator's reference reel (measured pixel by pixel):
 
-| flag | when |
+- Montserrat Bold (bundled in `fonts/`), sentence-case white captions, 1–3 words, no punctuation,
+  soft shadow, centred at y≈1310 just under the face; no word highlight.
+- Hook: two black rounded boxes at the top (y≈234), white line + gold (`#F2C14E`) line, ~3.8 s.
+- A zoom change at least every ~3 s (set in `plan --max-shot 3`), so a single camera feels like a
+  multi-cam podcast edit; pauses up to 0.45 s are kept natural, longer ones cut.
+- Audio normalised to −11 LUFS (loud, like the reference).
+
+`--style bold` gives the alternative Hormozi look (UPPERCASE, yellow word highlight, higher captions, −14 LUFS).
+
+Optional extras (use them when the user provides the info/files):
+
+| flag | what |
 |---|---|
-| `--caption-y 1000` | captions collide with chin/hands — move up (keep < 1248) |
-| `--anchor 0.25` | face is high in frame, crop/zoom keeps cutting the head (0 = top, 1 = bottom) |
+| `--lower-title "Podcast with Sha-En Yeo" --lower-sub "Singapore's First Happiness Scientist"` | gold-bar name card, 4–8 s (`--lower-start`, `--lower-duration`) |
+| `--broll "w109-115=gym.mp4,L4=seminar.mov"` | full-screen cutaway while those words are spoken (speaker audio continues). Pick moments where the words describe something visual: "my coaches", "a personal trainer", "seminars" |
+| `--end-heading "Full Episode:" --end-handle "@MasterImplementers" --end-image thumb.jpg --end-text "Episode title" --end-cta 'Comment “SHAEN” for the full video'` | 4.5 s branded end card on a blue gradient (`--end-logo logo.png`, `--end-colors "#1F4FA0,#8A8F99"`) |
+| `--caption-y 1200` / `--anchor 0.25` | captions hit the chin / zoom crops the head |
 | `--fit pad` / `--fit crop` | landscape source: blurred background (auto default) vs fill-crop |
-| `--highlight "#00E5FF"` `--font "Montserrat"` | brand colours / font (drop .ttf files into `SKILL_DIR/fonts/`) |
-| `--words-per-caption 2` `--caption-size 90` | punchier/larger captions |
-| `--no-uppercase` `--no-captions` `--hook ""` | style off-switches |
-| `--hook-duration 2.5` | hook on screen shorter/longer |
+| `--accent "#00E5FF"` `--font "Name"` `--caption-size 80` | brand tweaks (drop extra .ttf files into `SKILL_DIR/fonts/`) |
+| `--hook-duration 3` `--hook ""` `--no-captions` | timing / off-switches |
 | `--out path.mp4` | custom output name |
 
 ## 5. Check your work visually (required)
@@ -104,7 +116,9 @@ python3 SKILL_DIR/scripts/reel.py preview "VIDEO"
 
 Then **Read `<video-name>_reel/preview.jpg`** — a contact sheet of frames just after each cut, with
 Instagram's UI zones tinted red. Verify:
-- captions and the hook sit outside the red zones and don't cover the mouth/eyes;
+- the hook stays outside the red zones; captions sit just under the face without covering the mouth
+  (the house style deliberately puts captions at y≈1310, just inside the top of the bottom zone —
+  that matches the reference, so don't "fix" it unless they collide with something);
 - the punch-in zoom doesn't crop the top of the head (else lower `--anchor` or use `--zooms 1.0,1.08`);
 - nothing looks broken (black frames, wrong orientation).
 
@@ -120,9 +134,9 @@ for retakes/tangents), and the path to `hooks.md`. Offer variations.
 Instagram lets you test a reel on non-followers. Render the same edit with 3 different hooks:
 
 ```bash
-python3 SKILL_DIR/scripts/reel.py render "VIDEO" --hook "Hook A" --out "NAME_A.mp4"
-python3 SKILL_DIR/scripts/reel.py render "VIDEO" --hook "Hook B" --highlight "#00E5FF" --out "NAME_B.mp4"
-python3 SKILL_DIR/scripts/reel.py render "VIDEO" --hook "Hook C" --words-per-caption 1 --out "NAME_C.mp4"
+python3 SKILL_DIR/scripts/reel.py render "VIDEO" --hook "“Quote A | Line Two”" --out "NAME_A.mp4"
+python3 SKILL_DIR/scripts/reel.py render "VIDEO" --hook "“Quote B | Line Two”" --out "NAME_B.mp4"
+python3 SKILL_DIR/scripts/reel.py render "VIDEO" --hook "HOOK C" --style bold --out "NAME_C.mp4"
 ```
 
 ## One-shot mode
@@ -135,4 +149,5 @@ pauses only, no retake removal) → render → preview. Use it only when the use
 - Claude can't watch video; decisions come from the transcript + preview frames. Retakes are
   detected from repeated words, not from facial expression.
 - Whisper sometimes drops fillers silently; the silence detector still trims the gap around them.
-- Single-speaker talking-head clips work best. No b-roll, music or sound effects are added.
+- Single-camera talking-head clips work best. B-roll only when the user supplies clips; no music or SFX.
+- Real camera-angle switches and guest cutaways need multiple source files (not supported yet).

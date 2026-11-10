@@ -293,6 +293,39 @@ def cmd_plan(a):
             merged.append(sg)
     segs = merged
 
+    # Long continuous takes get split into ~max_shot pieces at the quietest word gap, with the
+    # zoom alternating, so the reel "changes camera" every few seconds like a multi-cam edit.
+    if a.max_shot and a.max_shot > 0:
+        split = []
+        for sg in segs:
+            pieces = [sg]
+            while pieces[-1]["end"] - pieces[-1]["start"] > a.max_shot * 1.25:
+                cur_sg = pieces.pop()
+                target = cur_sg["start"] + a.max_shot
+                best = None
+                for i in range(cur_sg["words"][0], cur_sg["words"][1]):
+                    if i in drop or (i + 1) in drop:
+                        continue
+                    t = (words[i]["e"] + words[i + 1]["s"]) / 2
+                    if t - cur_sg["start"] < 1.2 or cur_sg["end"] - t < 1.2:
+                        continue
+                    score = abs(t - target) - 2.0 * (words[i + 1]["s"] - words[i]["e"])
+                    if words[i]["w"][-1:] in ".?!,":
+                        score -= 0.6
+                    if best is None or score < best[0]:
+                        best = (score, i, t)
+                if best is None:
+                    pieces.append(cur_sg)
+                    break
+                _, i, t = best
+                t = round(t, 3)
+                pieces.append({"start": cur_sg["start"], "end": t, "words": [cur_sg["words"][0], i],
+                               **({"join_prev": True} if cur_sg.get("join_prev") else {})})
+                pieces.append({"start": t, "end": cur_sg["end"], "words": [i + 1, cur_sg["words"][1]],
+                               "join_prev": True})
+            split.extend(pieces)
+        segs = split
+
     zooms = [float(z) for z in a.zooms.split(",")]
     for k, sg in enumerate(segs):
         sg["zoom"] = zooms[k % len(zooms)]
@@ -308,9 +341,10 @@ def cmd_plan(a):
         kept_text.append(" ".join(words[i]["w"] for i in range(sg["words"][0], sg["words"][1] + 1)
                                   if i not in drop))
     with open(os.path.join(wd, "edit.txt"), "w") as f:
-        f.write(f"# {len(segs)} segments, {dur:.1f}s raw → {out_dur:.1f}s reel\n")
+        f.write(f"# {len(segs)} shots, {dur:.1f}s raw → {out_dur:.1f}s reel   (~ = same take, just a zoom change)\n")
         for k, (sg, t) in enumerate(zip(segs, kept_text)):
-            f.write(f"S{k + 1:<3} [{fmt_t(sg['start'])}-{fmt_t(sg['end'])}] x{sg['zoom']:.2f} {t}\n")
+            j = "~" if sg.get("join_prev") else " "
+            f.write(f"S{k + 1:<3}{j}[{fmt_t(sg['start'])}-{fmt_t(sg['end'])}] x{sg['zoom']:.2f} {t}\n")
     print(f"{len(segs)} segments, {dur:.1f}s raw → {out_dur:.1f}s reel. Read {wd}/edit.txt")
     if out_dur > 90:
         print("warning: longer than 90s — Instagram Reels cap; trim more lines.")
@@ -318,11 +352,36 @@ def cmd_plan(a):
 
 # ---------------------------------------------------------------------------- render
 
+FONTS_DIR = os.path.abspath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fonts"))
+
+# Style presets. "podcast" was matched to the creator's reference reel (Nov 2026):
+# sentence-case Montserrat captions under the face, boxed 2-line quote hook (white / gold),
+# gold-bar lower third, -11 LUFS. "bold" is the classic Hormozi look.
+STYLES = {
+    "podcast": dict(font="Montserrat", caption_size=86, caption_y=1310, uppercase=False, highlight="none",
+                    words_per_caption=3, max_caption_chars=18, strip_punct=True, caption_box=False,
+                    hook_size=108, hook_y=234, hook_duration=3.8, hook_style="boxed", lufs=-11.0,
+                    accent="#F2C14E"),
+    "bold": dict(font=None, caption_size=80, caption_y=1130, uppercase=True, highlight="#FFE600",
+                 words_per_caption=3, max_caption_chars=16, strip_punct=False, caption_box=False,
+                 hook_size=68, hook_y=330, hook_duration=3.0, hook_style="card", lufs=-14.0,
+                 accent="#FFE600"),
+}
+
+
+def apply_style(a):
+    st = STYLES[a.style]
+    for k, v in st.items():
+        if getattr(a, k, None) is None:
+            setattr(a, k, v)
+    if not a.font:
+        a.font = default_font()
+
 
 def default_font():
-    if platform.system() == "Darwin":
-        return "Arial Black"
-    if platform.system() == "Windows":
+    if any(f.startswith("Montserrat") for f in os.listdir(FONTS_DIR)) if os.path.isdir(FONTS_DIR) else False:
+        return "Montserrat"
+    if platform.system() in ("Darwin", "Windows"):
         return "Arial Black"
     return "DejaVu Sans"
 
@@ -353,14 +412,75 @@ def wrap(text, width):
             line = (line + " " + word).strip()
     if line:
         out.append(line)
-    return "\\N".join(out)
+    return out
 
 
-def build_ass(words, edl, a, out_path):
-    """Word-by-word highlighted captions on the OUTPUT timeline + optional hook title."""
+_MEASURE_CACHE = {}
+
+
+def measure_text(text, font, size, bold=True):
+    """Pixel width/height of text as libass will render it (one tiny ffmpeg call, cached)."""
+    key = (text, font, size, bold)
+    if key in _MEASURE_CACHE:
+        return _MEASURE_CACHE[key]
+    import tempfile
+    import numpy as np
+    style = (f"Style: A,{font},{size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,{-1 if bold else 0},"
+             f"0,0,0,100,100,0,0,1,0,0,5,0,0,0,1")
+    body = "\n".join(ass_header([style]) + [
+        f"Dialogue: 0,0:00:00.00,0:00:01.00,A,,0,0,0,,{{\\an5\\pos({W // 2},{H // 2})\\q2}}{ass_escape(text)}"])
+    with tempfile.TemporaryDirectory() as td:
+        with open(os.path.join(td, "m.ass"), "w", encoding="utf-8") as f:
+            f.write(body + "\n")
+        fonts = f":fontsdir={FONTS_DIR}" if os.path.isdir(FONTS_DIR) else ""
+        raw = subprocess.run(["ffmpeg", "-loglevel", "error", "-f", "lavfi", "-i", f"color=black:s={W}x{H}:d=0.1",
+                              "-vf", f"ass=m.ass{fonts}", "-frames:v", "1", "-f", "rawvideo", "-pix_fmt", "gray", "-"],
+                             capture_output=True, cwd=td).stdout
+    try:
+        img = np.frombuffer(raw, np.uint8).reshape(H, W)
+        xs = np.where(img.max(0) > 100)[0]
+        ys = np.where(img.max(1) > 100)[0]
+        res = (int(xs[-1] - xs[0]), int(ys[-1] - ys[0]))
+    except Exception:  # noqa: BLE001  fall back to a char-count estimate
+        res = (int(len(text) * size * 0.34), int(size * 0.7))
+    _MEASURE_CACHE[key] = res
+    return res
+
+
+def rounded_rect(w, h, r):
+    r = max(0, min(r, w // 2, h // 2))
+    return (f"m {r} 0 l {w - r} 0 b {w} 0 {w} 0 {w} {r} l {w} {h - r} b {w} {h} {w} {h} {w - r} {h} "
+            f"l {r} {h} b 0 {h} 0 {h} 0 {h - r} l 0 {r} b 0 0 0 0 {r} 0")
+
+
+def split_two(text):
+    """Split a hook into two balanced lines (or at a user '|')."""
+    if "|" in text:
+        return [x.strip() for x in text.split("|") if x.strip()][:3]
+    ws = text.split()
+    if len(ws) < 4:
+        return [text]
+    best = min(range(1, len(ws)), key=lambda k: abs(len(" ".join(ws[:k])) - len(" ".join(ws[k:]))))
+    return [" ".join(ws[:best]), " ".join(ws[best:])]
+
+
+def ass_header(styles):
+    return [
+        "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {W}", f"PlayResY: {H}",
+        "WrapStyle: 0", "ScaledBorderAndShadow: yes", "",
+        "[V4+ Styles]",
+        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
+        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
+        "Alignment, MarginL, MarginR, MarginV, Encoding",
+        *styles, "", "[Events]",
+        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
+    ]
+
+
+def timed_words(words, edl):
+    """Kept words placed on the OUTPUT timeline."""
     drop = set(edl["dropped_words"])
-    timed = []  # (text, start, end) in output time
-    off = 0.0
+    timed, off = [], 0.0
     for sg in edl["segments"]:
         for i in range(sg["words"][0], sg["words"][1] + 1):
             if i in drop:
@@ -368,74 +488,122 @@ def build_ass(words, edl, a, out_path):
             w = words[i]
             s = off + max(0.0, w["s"] - sg["start"])
             e = off + min(sg["end"] - sg["start"], w["e"] - sg["start"])
-            timed.append([w["w"], s, max(e, s + 0.06)])
+            timed.append({"i": i, "w": w["w"], "s": s, "e": max(e, s + 0.06)})
         off += sg["end"] - sg["start"]
-    total = off
+    return timed, off
 
-    # chunk into 1-3 word groups
+
+def build_ass(timed, total, a, out_path):
     chunks, cur = [], []
     for k, t in enumerate(timed):
         cur.append(t)
         nxt = timed[k + 1] if k + 1 < len(timed) else None
-        chars = sum(len(x[0]) + 1 for x in cur)
+        chars = sum(len(x["w"]) + 1 for x in cur)
         brk = (nxt is None or len(cur) >= a.words_per_caption
-               or chars + len(nxt[0]) > a.max_caption_chars
-               or t[0][-1:] in ".?!,;:" or (nxt[1] - t[2]) > 0.35)
+               or chars + len(nxt["w"]) > a.max_caption_chars
+               or t["w"][-1:] in ".?!,;:" or (nxt["s"] - t["e"]) > 0.35)
         if brk:
             chunks.append(cur)
             cur = []
+    ends = []
     for k, c in enumerate(chunks):
-        nxt_start = chunks[k + 1][0][1] if k + 1 < len(chunks) else total
-        end = c[-1][2]
-        if nxt_start - end < 0.4:
-            end = nxt_start
-        c.append(end)  # chunk end marker
+        nxt_start = chunks[k + 1][0]["s"] if k + 1 < len(chunks) else total
+        end = c[-1]["e"]
+        ends.append(nxt_start if nxt_start - end < 0.4 else end)
 
-    font = a.font or default_font()
-    hi = ass_color(a.highlight)
-    lines = [
-        "[Script Info]", "ScriptType: v4.00+", f"PlayResX: {W}", f"PlayResY: {H}",
-        "WrapStyle: 0", "ScaledBorderAndShadow: yes", "",
-        "[V4+ Styles]",
-        "Format: Name, Fontname, Fontsize, PrimaryColour, SecondaryColour, OutlineColour, BackColour, "
-        "Bold, Italic, Underline, StrikeOut, ScaleX, ScaleY, Spacing, Angle, BorderStyle, Outline, Shadow, "
-        "Alignment, MarginL, MarginR, MarginV, Encoding",
-        f"Style: Cap,{font},{a.caption_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,"
-        f"-1,0,0,0,100,100,0,0,1,7,3,5,60,60,0,1",
-        f"Style: Hook,{font},{a.hook_size},&H00111111,&H00111111,&H00FFFFFF,&H00FFFFFF,"
-        f"-1,0,0,0,100,100,0,0,3,22,0,8,90,90,0,1",
-        "", "[Events]",
-        "Format: Layer, Start, End, Style, Name, MarginL, MarginR, MarginV, Effect, Text",
-    ]
-    y = a.caption_y
-    # nudge left of centre so text clears the right-hand like/comment rail
-    pos = f"\\an5\\pos({W // 2 - 30},{y})"
+    font = a.font
+    accent = ass_color(a.accent)
+    styles = []
+    if a.style == "podcast":
+        styles.append(f"Style: Cap,{font},{a.caption_size},&H00FFFFFF,&H00FFFFFF,&H90000000,&H00000000,"
+                      f"-1,0,0,0,100,100,0,0,1,3,0,5,60,60,0,1")
+    else:
+        styles.append(f"Style: Cap,{font},{a.caption_size},&H00FFFFFF,&H00FFFFFF,&H00000000,&H80000000,"
+                      f"-1,0,0,0,100,100,0,0,1,7,3,5,60,60,0,1")
+    # boxed hook: each line its own opaque black box
+    styles.append(f"Style: HookBox,{font},{a.hook_size},&H00FFFFFF,&H00FFFFFF,&H10141414,&H00000000,"
+                  f"-1,0,0,0,100,100,0,0,3,16,0,8,60,60,0,1")
+    styles.append(f"Style: Hook,{font},{a.hook_size},&H00111111,&H00111111,&H00FFFFFF,&H00FFFFFF,"
+                  f"-1,0,0,0,100,100,0,0,3,22,0,8,90,90,0,1")
+    styles.append(f"Style: LT1,{font},70,{accent},{accent},&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,4,0,0,0,1")
+    styles.append(f"Style: LT2,{font},50,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,4,0,0,0,1")
+    styles.append("Style: Box,Arial,10,&H40000000,&H40000000,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1")
+    lines = ass_header(styles)
+
+    cx = W // 2 - 20  # a touch left of centre to clear the right-hand button rail
     if not a.no_captions:
-        for c in chunks:
-            end = c[-1]
-            ws = c[:-1]
-            texts = [ass_escape(x[0].upper() if a.uppercase else x[0]) for x in ws]
-            for j, wd in enumerate(ws):
-                s = ws[0][1] if j == 0 else wd[1]
-                e = ws[j + 1][1] if j + 1 < len(ws) else end
+        hl = None if (a.highlight or "none").lower() == "none" else ass_color(a.highlight)
+        for c, end in zip(chunks, ends):
+            texts = []
+            for x in c:
+                t = x["w"]
+                if a.strip_punct:
+                    t = re.sub(r"[.,!?;:\"“”…]+", "", t)
+                if a.uppercase:
+                    t = t.upper()
+                texts.append(ass_escape(t))
+            pos = f"\\an5\\pos({cx},{a.caption_y})"
+            if a.style == "podcast":
+                lines.append(f"Dialogue: 1,{ass_time(c[0]['s'])},{ass_time(end)},Cap,,0,0,0,,"
+                             f"{{{pos}\\blur3}}" + " ".join(texts))
+                continue
+            for j in range(len(c)):
+                s = c[0]["s"] if j == 0 else c[j]["s"]
+                e = c[j + 1]["s"] if j + 1 < len(c) else end
                 if e <= s:
                     continue
-                parts = []
-                for q, txt in enumerate(texts):
-                    if q == j:
-                        parts.append(f"{{\\c{hi}&\\fscx108\\fscy108}}{txt}{{\\c&H00FFFFFF&\\fscx100\\fscy100}}")
-                    else:
-                        parts.append(txt)
+                parts = [(f"{{\\c{hl}&\\fscx108\\fscy108}}{txt}{{\\c&H00FFFFFF&\\fscx100\\fscy100}}"
+                          if (q == j and hl) else txt) for q, txt in enumerate(texts)]
                 pop = "\\fscx92\\fscy92\\t(0,80,\\fscx100\\fscy100)" if j == 0 else ""
                 lines.append(f"Dialogue: 1,{ass_time(s)},{ass_time(e)},Cap,,0,0,0,,{{{pos}{pop}}}" + " ".join(parts))
+
     if a.hook:
         hd = min(a.hook_duration, total)
-        txt = wrap(ass_escape(a.hook), 20)
-        lines.append(f"Dialogue: 2,{ass_time(0)},{ass_time(hd)},Hook,,0,0,0,,"
-                     f"{{\\an8\\pos({W // 2 - 30},{a.hook_y})\\fad(0,200)}}{txt}")
+        if a.hook_style == "boxed":
+            hook_lines = split_two(a.hook)
+            size = a.hook_size
+            widest = max(measure_text(ln, font, size)[0] for ln in hook_lines)
+            if widest > W - 180:  # long hook: shrink to fit
+                size = int(size * (W - 180) / widest)
+            box_h = int(size * 0.74)
+            pitch = box_h + 4
+            for n, ln in enumerate(hook_lines):
+                tw, _ = measure_text(ln, font, size)
+                bw = tw + int(size * 0.5)
+                top = a.hook_y + n * pitch
+                col = "\\c&HFFFFFF&" if n % 2 == 0 else f"\\c{accent}&"
+                lines.append(f"Dialogue: 2,{ass_time(0)},{ass_time(hd)},Box,,0,0,0,,"
+                             f"{{\\an7\\pos({cx - bw // 2},{top})\\p1\\1c&H141414&\\1a&H10&\\fad(0,150)}}"
+                             f"{rounded_rect(bw, box_h, int(size * 0.1))}{{\\p0}}")
+                lines.append(f"Dialogue: 3,{ass_time(0)},{ass_time(hd)},Cap,,0,0,0,,"
+                             f"{{\\an5\\pos({cx},{top + box_h // 2 + int(size * 0.03)})\\fs{size}\\bord0\\shad0"
+                             f"{col}\\fad(0,150)}}{ass_escape(ln)}")
+        else:
+            txt = "\\N".join(wrap(ass_escape(a.hook), 20))
+            lines.append(f"Dialogue: 2,{ass_time(0)},{ass_time(hd)},Hook,,0,0,0,,"
+                         f"{{\\an8\\pos({cx},{a.hook_y})\\fad(0,200)}}{txt}")
+
+    if a.lower_title:
+        s0 = min(a.lower_start, max(0.0, total - 1))
+        s1 = min(total, s0 + a.lower_duration)
+        y0 = a.lower_y
+        tw = measure_text(a.lower_title, font, 70)[0]
+        sw = measure_text(a.lower_sub, font, 50, bold=False)[0] if a.lower_sub else 0
+        bw = min(max(tw, sw) + 38 + 34, W - 120)
+        bh = 150 if a.lower_sub else 96
+        fad = "\\fad(200,200)"
+        lines.append(f"Dialogue: 3,{ass_time(s0)},{ass_time(s1)},Box,,0,0,0,,"
+                     f"{{\\an7\\pos(80,{y0})\\p1\\1c&H000000&\\1a&H30&{fad}}}m 0 0 l {bw} 0 {bw} {bh} 0 {bh}{{\\p0}}")
+        lines.append(f"Dialogue: 4,{ass_time(s0)},{ass_time(s1)},Box,,0,0,0,,"
+                     f"{{\\an7\\pos(80,{y0})\\p1\\1c{accent}&\\1a&H00&{fad}}}m 0 0 l 12 0 12 {bh} 0 {bh}{{\\p0}}")
+        ty = y0 + (48 if a.lower_sub else bh // 2)
+        lines.append(f"Dialogue: 5,{ass_time(s0)},{ass_time(s1)},LT1,,0,0,0,,"
+                     f"{{\\an4\\pos(118,{ty}){fad}}}{ass_escape(a.lower_title)}")
+        if a.lower_sub:
+            lines.append(f"Dialogue: 5,{ass_time(s0)},{ass_time(s1)},LT2,,0,0,0,,"
+                         f"{{\\an4\\pos(118,{y0 + 106}){fad}}}{ass_escape(a.lower_sub)}")
     with open(out_path, "w", encoding="utf-8") as f:
         f.write("\n".join(lines) + "\n")
-    return total
 
 
 def fit_filter(zoom, mode, anchor):
@@ -447,8 +615,101 @@ def fit_filter(zoom, mode, anchor):
             f"x='(iw-ow)/2':y='(ih-oh)*{anchor}',scale={W}:{H}:flags=lanczos,setsar=1")
 
 
+def snap(t):
+    return round(round(t * FPS) / FPS, 6)
+
+
+def make_endcard(a, wd, out):
+    """Branded end card: gradient, optional logo + thumbnail, heading/handle/title/CTA text."""
+    d = a.end_duration
+    bg = os.path.join(wd, "end_bg.png")
+    c0, c1 = [c.strip().lstrip("#") for c in a.end_colors.split(",")[:2]]
+    ch = [(int(c0[i:i + 2], 16), int(c1[i:i + 2], 16)) for i in (0, 2, 4)]
+    geq = ":".join(f"{n}='{x}+({y}-{x})*Y/H'" for n, (x, y) in zip("rgb", ch))
+    run(["ffmpeg", "-y", "-hide_banner", "-f", "lavfi", "-i", f"color=black:s={W}x{H}", "-vf",
+         f"format=rgb24,geq={geq}",
+         "-frames:v", "1", bg])
+    font = a.font
+    styles = [f"Style: H,{font},116,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,8,60,60,0,1",
+              f"Style: S,{font},84,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,8,60,60,0,1",
+              f"Style: T,{font},74,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,8,90,90,0,1"]
+    ev = ass_header(styles)
+    t1 = ass_time(d)
+    y = 400  # same layout with or without a logo
+    if a.end_heading:
+        ev.append(f"Dialogue: 0,0:00:00.00,{t1},H,,0,0,0,,{{\\an8\\pos({W // 2},{y})}}{ass_escape(a.end_heading)}")
+    if a.end_handle:
+        ev.append(f"Dialogue: 0,0:00:00.00,{t1},S,,0,0,0,,{{\\an8\\pos({W // 2},{y + 118})}}{ass_escape(a.end_handle)}")
+    img_top, img_h = y + 225, 0
+    if a.end_image:
+        img_h = 440
+    ty = img_top + img_h + 60
+    for n, part in enumerate([a.end_text, a.end_cta]):
+        if not part:
+            continue
+        txt = "\\N".join(wrap(ass_escape(part), 24))
+        ev.append(f"Dialogue: 0,0:00:00.00,{t1},T,,0,0,0,,{{\\an8\\pos({W // 2},{ty})}}{txt}")
+        ty += 92 * len(wrap(part, 24)) + 80
+    with open(os.path.join(wd, "endcard.ass"), "w", encoding="utf-8") as f:
+        f.write("\n".join(ev) + "\n")
+    inputs = ["-loop", "1", "-framerate", str(FPS), "-t", f"{d:.3f}", "-i", bg]
+    fc, last, idx = [], "[0:v]", 1
+    if a.end_logo:
+        inputs += ["-i", a.end_logo]
+        fc.append(f"[{idx}:v]scale=620:-1[lg];{last}[lg]overlay=(W-w)/2:{y - 190}[v{idx}]")
+        last, idx = f"[v{idx}]", idx + 1
+    if a.end_image:
+        inputs += ["-i", a.end_image]
+        fc.append(f"[{idx}:v]scale=780:{img_h}:force_original_aspect_ratio=increase,crop=780:{img_h},"
+                  f"pad=792:{img_h + 12}:6:6:color=0x222222[im];{last}[im]overlay=(W-w)/2:{img_top}[v{idx}]")
+        last, idx = f"[v{idx}]", idx + 1
+    fonts = f":fontsdir={FONTS_DIR}" if os.path.isdir(FONTS_DIR) else ""
+    fc.append(f"{last}ass=endcard.ass{fonts},fps={FPS},format=yuv420p[v]")
+    inputs += ["-f", "lavfi", "-t", f"{d:.3f}", "-i", "anullsrc=r=48000:cl=stereo"]
+    run(["ffmpeg", "-y", "-hide_banner", *inputs, "-filter_complex", ";".join(fc), "-map", "[v]",
+         "-map", f"{idx}:a", "-t", f"{d:.3f}", "-c:v", "libx264", "-preset", "veryfast", "-crf", "16",
+         "-c:a", "pcm_s16le", out], cwd=wd)
+
+
+def parse_broll(spec, timed, lines):
+    """'w60-65=gym.mp4,L4=seminar.mov' -> [(out_start, out_end, path)]"""
+    out = []
+    if not spec:
+        return out
+    by_i = {t["i"]: t for t in timed}
+    for item in spec.split(","):
+        if "=" not in item:
+            die(f"b-roll item '{item}' needs RANGE=FILE")
+        rng, path = item.split("=", 1)
+        rng, path = rng.strip(), os.path.expanduser(path.strip())
+        if not os.path.exists(path):
+            die(f"b-roll file not found: {path}")
+        m = re.fullmatch(r"[Ll](\d+)", rng)
+        if m:
+            w1, w2 = lines[int(m.group(1)) - 1]
+        else:
+            m = re.fullmatch(r"[Ww]?(\d+)-[Ww]?(\d+)", rng) or re.fullmatch(r"[Ww]?(\d+)", rng)
+            if not m:
+                die(f"can't parse b-roll range '{rng}'")
+            w1 = int(m.group(1))
+            w2 = int(m.group(2)) if m.lastindex and m.lastindex > 1 else w1
+        kept = [by_i[i] for i in range(w1, w2 + 1) if i in by_i]
+        if not kept:
+            die(f"b-roll range {rng} covers no kept words")
+        out.append((kept[0]["s"], kept[-1]["e"], os.path.abspath(path)))
+    return out
+
+
 def cmd_render(a):
     need("ffmpeg")
+    apply_style(a)
+    for k in ("end_image", "end_logo"):
+        v = getattr(a, k)
+        if v:
+            v = os.path.abspath(os.path.expanduser(v))
+            if not os.path.exists(v):
+                die(f"--{k.replace('_', '-')} file not found: {v}")
+            setattr(a, k, v)
     wd = workdir(a.video)
     for f in ("words.json", "edl.json"):
         if not os.path.exists(os.path.join(wd, f)):
@@ -459,6 +720,10 @@ def cmd_render(a):
     info = probe(src)
     if not info["has_video"]:
         die("source has no video stream")
+    # Snap every cut to the frame grid so audio and video stay in sync across many cuts.
+    for sg in edl["segments"]:
+        sg["start"], sg["end"] = snap(sg["start"]), snap(sg["end"])
+    edl["segments"] = [sg for sg in edl["segments"] if sg["end"] - sg["start"] >= 2 / FPS]
     segdir = os.path.join(wd, "segs")
     shutil.rmtree(segdir, ignore_errors=True)
     os.makedirs(segdir)
@@ -467,35 +732,54 @@ def cmd_render(a):
         mode = "pad" if info["width"] > info["height"] else "crop"
 
     listing = []
-    n = len(edl["segments"])
-    for k, sg in enumerate(edl["segments"]):
+    segs = edl["segments"]
+    n = len(segs)
+    for k, sg in enumerate(segs):
         d = sg["end"] - sg["start"]
         out = os.path.join(segdir, f"s{k:04d}.mkv")
         fade = min(0.025, d / 4)
+        fades = []
+        if not sg.get("join_prev"):
+            fades.append(f"afade=t=in:d={fade:.3f}")
+        if not (k + 1 < n and segs[k + 1].get("join_prev")):
+            fades.append(f"afade=t=out:st={d - fade:.3f}:d={fade:.3f}")
         vf = fit_filter(sg.get("zoom", 1.0) if mode == "crop" else 1.0, mode, a.anchor) + f",fps={FPS},format=yuv420p"
-        af = (f"aresample=48000,aformat=channel_layouts=stereo,afade=t=in:d={fade:.3f},"
-              f"afade=t=out:st={d - fade:.3f}:d={fade:.3f}")
-        run(["ffmpeg", "-y", "-hide_banner", "-ss", f"{sg['start']:.3f}", "-i", src, "-t", f"{d:.3f}",
+        af = ",".join(["aresample=48000", "aformat=channel_layouts=stereo", *fades])
+        run(["ffmpeg", "-y", "-hide_banner", "-ss", f"{sg['start']:.4f}", "-i", src, "-t", f"{d:.4f}",
              "-filter_complex", f"[0:v]{vf}[v];[0:a]{af}[a]", "-map", "[v]", "-map", "[a]",
              "-c:v", "libx264", "-preset", "veryfast", "-crf", "16", "-c:a", "pcm_s16le", out])
         listing.append(f"file '{out}'")
-        print(f"  segment {k + 1}/{n}", end="\r")
+        print(f"  shot {k + 1}/{n}", end="\r")
     print()
+    timed, total = timed_words(data["words"], edl)
+    if a.end_heading or a.end_cta or a.end_image:
+        endc = os.path.join(segdir, "endcard.mkv")
+        make_endcard(a, wd, endc)
+        listing.append(f"file '{endc}'")
     with open(os.path.join(segdir, "list.txt"), "w") as f:
         f.write("\n".join(listing) + "\n")
     joined = os.path.join(wd, "joined.mkv")
     run(["ffmpeg", "-y", "-hide_banner", "-f", "concat", "-safe", "0", "-i", os.path.join(segdir, "list.txt"),
          "-c", "copy", joined])
 
-    build_ass(data["words"], edl, a, os.path.join(wd, "captions.ass"))
+    build_ass(timed, total, a, os.path.join(wd, "captions.ass"))
     name = os.path.splitext(os.path.basename(src))[0]
     final = a.out or os.path.join(os.path.dirname(wd), f"{name}_reel.mp4")
-    vf = "ass=captions.ass"
-    fonts = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "fonts")
-    if os.path.isdir(fonts) and any(f.lower().endswith((".ttf", ".otf")) for f in os.listdir(fonts)):
-        vf = f"ass=captions.ass:fontsdir={os.path.abspath(fonts)}"
-    af = "loudnorm=I=-14:TP=-1.5:LRA=11,aresample=48000" if not a.no_loudnorm else "anull"
-    run(["ffmpeg", "-y", "-hide_banner", "-i", joined, "-vf", vf, "-af", af,
+    fonts = f":fontsdir={FONTS_DIR}" if os.path.isdir(FONTS_DIR) else ""
+
+    # b-roll: full-frame cutaways over chosen words; speaker audio continues underneath.
+    inputs, fc, last = ["-i", joined], [], "[0:v]"
+    for k, (s0, s1, path) in enumerate(parse_broll(a.broll, timed, data["lines"])):
+        inputs += ["-i", path]
+        dur_b = s1 - s0 + 0.1
+        fc.append(f"[{k + 1}:v]trim=0:{dur_b:.3f},setpts=PTS-STARTPTS+{s0:.3f}/TB,"
+                  f"scale={W}:{H}:force_original_aspect_ratio=increase,crop={W}:{H},setsar=1,fps={FPS}[b{k}]")
+        fc.append(f"{last}[b{k}]overlay=eof_action=pass:enable='between(t,{s0:.3f},{s1 + 0.05:.3f})'[o{k}]")
+        last = f"[o{k}]"
+    fc.append(f"{last}ass=captions.ass{fonts}[v]")
+    af = f"loudnorm=I={a.lufs}:TP=-1.0:LRA=11,aresample=48000" if not a.no_loudnorm else "anull"
+    fc.append(f"[0:a]{af}[a]")
+    run(["ffmpeg", "-y", "-hide_banner", *inputs, "-filter_complex", ";".join(fc), "-map", "[v]", "-map", "[a]",
          "-c:v", "libx264", "-preset", "medium", "-crf", "19", "-profile:v", "high", "-pix_fmt", "yuv420p",
          "-r", str(FPS), "-c:a", "aac", "-b:a", "192k", "-ar", "48000", "-movflags", "+faststart",
          os.path.abspath(final)], cwd=wd)
@@ -503,8 +787,9 @@ def cmd_render(a):
         shutil.rmtree(segdir, ignore_errors=True)
         os.remove(joined)
     dur = probe(final)["duration"]
-    print(f"Done → {final}  ({dur:.1f}s, {W}x{H})")
+    print(f"Done → {final}  ({dur:.1f}s, {W}x{H}, style={a.style})")
     save(os.path.join(wd, "last_render.json"), {"final": os.path.abspath(final), "duration": dur})
+    save(os.path.join(wd, "render_edl.json"), edl)
 
 
 # --------------------------------------------------------------------------- preview
@@ -517,7 +802,8 @@ def cmd_preview(a):
         die("render first")
     final = load(lr)["final"]
     dur = probe(final)["duration"]
-    edl = load(os.path.join(wd, "edl.json"))
+    edl = load(os.path.join(wd, "render_edl.json") if os.path.exists(os.path.join(wd, "render_edl.json"))
+               else os.path.join(wd, "edl.json"))
     # sample: just after every cut (where jumps show) + evenly spaced, max 12 frames
     times, off = [], 0.0
     for sg in edl["segments"]:
@@ -578,28 +864,49 @@ def main():
     def p_args(sp):
         sp.add_argument("--drop", default="", help="lines/words to cut: L3,L5-L7,w40-52")
         sp.add_argument("--keep-fillers", action="store_true", help="don't auto-cut um/uh")
-        sp.add_argument("--max-pause", type=float, default=0.30, help="pauses longer than this get cut (s)")
-        sp.add_argument("--pad-in", type=float, default=0.06)
-        sp.add_argument("--pad-out", type=float, default=0.10)
+        sp.add_argument("--max-pause", type=float, default=0.45, help="pauses longer than this get cut (s)")
+        sp.add_argument("--pad-in", type=float, default=0.08)
+        sp.add_argument("--pad-out", type=float, default=0.12)
         sp.add_argument("--noise-db", type=float, default=-35)
-        sp.add_argument("--zooms", default="1.0,1.12", help="zoom cycle per segment (punch-ins hide jump cuts)")
+        sp.add_argument("--zooms", default="1.0,1.15", help="zoom cycle per shot (punch-ins hide jump cuts)")
+        sp.add_argument("--max-shot", type=float, default=3.0,
+                        help="switch zoom at least every N seconds within long takes (0 = off)")
 
     def r_args(sp):
-        sp.add_argument("--hook", default="", help="on-screen hook text for the first seconds")
-        sp.add_argument("--hook-duration", type=float, default=3.0)
-        sp.add_argument("--hook-y", type=int, default=330)
-        sp.add_argument("--hook-size", type=int, default=68)
-        sp.add_argument("--caption-y", type=int, default=1130, help="caption centre y (keep < 1248)")
-        sp.add_argument("--caption-size", type=int, default=80)
-        sp.add_argument("--max-caption-chars", type=int, default=16)
-        sp.add_argument("--words-per-caption", type=int, default=3)
-        sp.add_argument("--highlight", default="#FFE600", help="active-word colour")
+        sp.add_argument("--style", choices=sorted(STYLES), default="podcast",
+                        help="podcast (default, matches the reference reel) or bold (Hormozi)")
+        sp.add_argument("--hook", default="", help="on-screen hook; use | to choose the line break")
+        sp.add_argument("--hook-duration", type=float, default=None)
+        sp.add_argument("--hook-y", type=int, default=None)
+        sp.add_argument("--hook-size", type=int, default=None)
+        sp.add_argument("--caption-y", type=int, default=None, help="caption centre y")
+        sp.add_argument("--caption-size", type=int, default=None)
+        sp.add_argument("--max-caption-chars", type=int, default=None)
+        sp.add_argument("--words-per-caption", type=int, default=None)
+        sp.add_argument("--highlight", default=None, help="active-word colour, or none")
+        sp.add_argument("--accent", default=None, help="accent colour (hook line 2, lower-third)")
         sp.add_argument("--font", default=None)
+        sp.add_argument("--uppercase", dest="uppercase", action="store_true", default=None)
         sp.add_argument("--no-uppercase", dest="uppercase", action="store_false")
         sp.add_argument("--no-captions", action="store_true")
+        sp.add_argument("--lower-title", default="", help='lower-third title, e.g. "Podcast with Sha-En Yeo"')
+        sp.add_argument("--lower-sub", default="", help="lower-third subtitle")
+        sp.add_argument("--lower-start", type=float, default=4.0)
+        sp.add_argument("--lower-duration", type=float, default=4.0)
+        sp.add_argument("--lower-y", type=int, default=1335)
+        sp.add_argument("--broll", default="", help="cutaways: w60-65=gym.mp4,L4=seminar.mov")
+        sp.add_argument("--end-heading", default="", help='end card heading, e.g. "Full Episode:"')
+        sp.add_argument("--end-handle", default="")
+        sp.add_argument("--end-text", default="", help="end card title text")
+        sp.add_argument("--end-cta", default="", help='e.g. Comment "SHAEN" for the full video')
+        sp.add_argument("--end-image", default="", help="thumbnail image for the end card")
+        sp.add_argument("--end-logo", default="", help="logo image (PNG with transparency)")
+        sp.add_argument("--end-duration", type=float, default=4.5)
+        sp.add_argument("--end-colors", default="#1F4FA0,#8A8F99", help="gradient top,bottom")
         sp.add_argument("--fit", choices=["auto", "crop", "pad"], default="auto",
                         help="crop to 9:16 or blurred-pad (auto: pad landscape, crop vertical)")
         sp.add_argument("--anchor", type=float, default=0.35, help="crop/zoom vertical anchor 0=top 1=bottom")
+        sp.add_argument("--lufs", type=float, default=None)
         sp.add_argument("--no-loudnorm", action="store_true")
         sp.add_argument("--keep-temp", action="store_true")
         sp.add_argument("--out", default=None)
