@@ -134,6 +134,15 @@ hide during text cards. Write a `cards.json` next to the video and pass `--cards
   1.5–8 s each. Photo cards (person/logo/screenshot) need an image from the user; never pull
   photos of people from the web.
 
+`--style promo` is the motion-ad look: Inter captions (one line) that reveal word by word, with
+chosen words emphasised via `--emph "w25=serif,w217=bold,w467=circle"` — `serif` = big Instrument
+Serif italic, `bold` = Inter Bold, `circle` = bold + red hand-drawn ring that draws itself in.
+Pick ~1 emphasis per 2–3 captions: emotional words → serif, key facts/numbers → bold, the 2–4
+words the whole video hinges on → circle. Cards use a generated blue light-ray panel; in card
+text `**word**` = bold, `*word*` = serif italic, `# ` = big bold header. Add `"split": true` to a
+card to put the panel in the top half and keep the speaker visible in the bottom half
+(`--split-crop-y` moves the speaker crop). B-roll works the same as in the other styles.
+
 `--style bold` gives the alternative Hormozi look (UPPERCASE, yellow word highlight, higher captions, −14 LUFS).
 
 Optional extras (use them when the user provides the info/files):

@@ -368,6 +368,12 @@ STYLES = {
                   highlight="none", words_per_caption=3, max_caption_chars=18, strip_punct=True,
                   caption_box=False, hook_size=108, hook_y=234, hook_duration=3.8, hook_style="boxed",
                   lufs=-14.0, accent="#F7B500"),
+    # "promo": motion-ad look — Inter captions revealed word by word, chosen words in serif italic /
+    # bold / bold + red hand-drawn circle; blue light-ray panels (full or split screen).
+    "promo": dict(font="Inter Medium", caption_size=84, caption_y=1188, uppercase=False, lowercase=False,
+                  highlight="none", words_per_caption=4, max_caption_chars=22, strip_punct=True,
+                  caption_box=False, hook_size=108, hook_y=234, hook_duration=3.8, hook_style="boxed",
+                  lufs=-14.0, accent="#E53935"),
     "bold": dict(font=None, caption_size=80, caption_y=1130, uppercase=True, highlight="#FFE600",
                  words_per_caption=3, max_caption_chars=16, strip_punct=False, caption_box=False,
                  hook_size=68, hook_y=330, hook_duration=3.0, hook_style="card", lufs=-14.0,
@@ -495,7 +501,7 @@ def timed_words(words, edl):
             w = words[i]
             s = off + max(0.0, w["s"] - sg["start"])
             e = off + min(sg["end"] - sg["start"], w["e"] - sg["start"])
-            if timed and w["w"].startswith("-") and len(w["w"]) > 1:
+            if timed and len(w["w"]) > 1 and (w["w"][0] == "-" or (w["w"][0] == "," and w["w"][1].isdigit())):
                 timed[-1]["w"] += w["w"]
                 timed[-1]["e"] = max(timed[-1]["e"], e)
                 continue
@@ -536,6 +542,64 @@ def make_grid_bg(path):
     if p.returncode != 0:
         die("could not create card background: " + p.stderr.decode(errors="ignore")[-300:])
     return path
+
+
+def make_blue_bg(path):
+    """Promo panel: blue gradient with soft diagonal light rays and a gentle vignette."""
+    if os.path.exists(path):
+        return path
+    import numpy as np
+    yy, xx = np.mgrid[0:H, 0:W].astype(np.float32)
+    t = yy / H
+    top, bot = np.array([78, 152, 236]), np.array([30, 96, 196])
+    img = top[None, None, :] * (1 - t[..., None]) + bot[None, None, :] * t[..., None]
+    rays = np.zeros((H, W), np.float32)
+    rng = np.random.default_rng(3)
+    for _ in range(7):
+        x0, wdt, strength = rng.uniform(-200, W + 200), rng.uniform(40, 140), rng.uniform(0.25, 0.6)
+        d = np.abs((xx - x0) - (yy * 0.45))  # slanted bands
+        rays += strength * np.exp(-(d / wdt) ** 2) * np.clip(1.15 - t * 1.6, 0, 1)
+    img = img + rays[..., None] * np.array([90, 90, 60])[None, None, :]
+    r = np.sqrt(((xx - W / 2) / (W * 0.75)) ** 2 + ((yy - H / 2) / (H * 0.75)) ** 2)
+    img = img * (1 - 0.35 * np.clip(r - 0.55, 0, 1)[..., None])
+    rgb = np.clip(img, 0, 255).astype(np.uint8)
+    p = subprocess.run(["ffmpeg", "-y", "-loglevel", "error", "-f", "rawvideo", "-pix_fmt", "rgb24",
+                        "-s", f"{W}x{H}", "-i", "-", "-frames:v", "1", path], input=rgb.tobytes(), capture_output=True)
+    if p.returncode != 0:
+        die("could not create promo background")
+    return path
+
+
+def ellipse_path(rx, ry):
+    """Ellipse in positive coordinates (0..2rx, 0..2ry) so libass centres it correctly with \\an5."""
+    k = 0.5523
+    cx, cy = rx, ry
+    pts = lambda x, y: f"{cx + x:.0f} {cy + y:.0f}"  # noqa: E731
+    return (f"m {pts(-rx, 0)} b {pts(-rx, -k * ry)} {pts(-k * rx, -ry)} {pts(0, -ry)} "
+            f"b {pts(k * rx, -ry)} {pts(rx, -k * ry)} {pts(rx, 0)} "
+            f"b {pts(rx, k * ry)} {pts(k * rx, ry)} {pts(0, ry)} "
+            f"b {pts(-k * rx, ry)} {pts(-rx, k * ry)} {pts(-rx, 0)}")
+
+
+PROMO_FONTS = {"body": "Inter Medium", "bold": "Inter", "serif": "Instrument Serif"}
+
+
+def promo_word(txt, kind, size):
+    """ASS markup for one caption/card word in the promo look."""
+    t = ass_escape(txt)
+    if kind == "serif":
+        return f"{{\\fnInstrument Serif\\i1\\b0\\fs{int(size * 1.42)}}}{t}{{\\r}}"
+    if kind in ("bold", "circle"):
+        return f"{{\\fnInter\\b1\\fs{int(size * 1.08)}}}{t}{{\\r}}"
+    return t
+
+
+def promo_word_width(txt, kind, size):
+    if kind == "serif":
+        return measure_text(txt, "Instrument Serif", int(size * 1.42), bold=False)[0]
+    if kind in ("bold", "circle"):
+        return measure_text(txt, "Inter", int(size * 1.08), bold=True)[0]
+    return measure_text(txt, "Inter Medium", size, bold=False)[0]
 
 
 def parse_cards(path, timed, lines):
@@ -582,7 +646,22 @@ def _card_line_markup(line, size, accent):
                    else ass_escape(p) for p in parts)
 
 
+def _promo_line_markup(line, size):
+    """'**bold**', '*serif italic*' markup for promo cards."""
+    out = []
+    for p in re.split(r"(\*\*[^*]+\*\*|\*[^*]+\*)", line):
+        if p.startswith("**") and p.endswith("**") and len(p) > 4:
+            out.append(promo_word(p[2:-2], "bold", size))
+        elif p.startswith("*") and p.endswith("*") and len(p) > 2:
+            out.append(promo_word(p[1:-1], "serif", size))
+        else:
+            out.append(ass_escape(p))
+    return "".join(out)
+
+
 def card_events(cards, a):
+    if a.style == "promo":
+        return promo_card_events(cards, a)
     accent = ass_color(CARD_ORANGE)
     ev = []
     size = 118
@@ -630,6 +709,39 @@ def card_events(cards, a):
     return ev
 
 
+def promo_card_events(cards, a):
+    ev, size = [], 92
+    for c in cards:
+        s1 = ass_time(c["e"])
+        rows = c.get("text") or []
+        if c.get("image"):
+            continue
+        heights = [size * (1.25 if r.startswith("# ") else (0.98 if "*" in r else 0.82)) for r in rows]
+        center = 480 if c.get("split") else 1000
+        y = center - sum(heights) / 2
+        spoken = [(norm(w["w"]), w["s"]) for w in c["words"]]
+        cursor, n = 0, len(rows)
+        for k, (r, hgt) in enumerate(zip(rows, heights)):
+            header = r.startswith("# ")
+            txt = r[2:] if header else r
+            first = norm(re.sub(r"[*#]", "", txt).split()[0]) if txt.split() else ""
+            t_show = None
+            for j in range(cursor, len(spoken)):
+                if spoken[j][0] == first:
+                    t_show, cursor = spoken[j][1], j + 1
+                    break
+            if t_show is None:
+                t_show = c["s"] + (c["e"] - c["s"]) * 0.6 * k / max(1, n)
+            t_show = max(c["s"], min(t_show, c["e"] - 0.4))
+            cy = int(y + hgt / 2)
+            y += hgt
+            body = (f"{{\\fnInter\\b1\\fs{int(size * 1.5)}}}{ass_escape(re.sub(r'[*]', '', txt))}" if header
+                    else _promo_line_markup(txt, size))
+            ev.append(f"Dialogue: 6,{ass_time(t_show)},{s1},PromoTxt,,0,0,0,,{{\\an5\\q2\\blur2\\fad(200,0)"
+                      f"\\move({W // 2},{cy + 18},{W // 2},{cy},0,220)}}{body}")
+    return ev
+
+
 def _lower(word, prev):
     """lowercase like the reference: keep acronyms/brands (LinkedIn, APSS), drop 'I' and sentence caps."""
     core = re.sub(r"[^\w']", "", word)
@@ -664,6 +776,9 @@ def build_ass(timed, total, a, out_path, cards=()):
     if a.style == "podcast":
         styles.append(f"Style: Cap,{font},{a.caption_size},&H00FFFFFF,&H00FFFFFF,&H90000000,&H00000000,"
                       f"-1,0,0,0,100,100,0,0,1,3,0,5,60,60,0,1")
+    elif a.style == "promo":
+        styles.append(f"Style: Cap,Inter Medium,{a.caption_size},&H00FFFFFF,&H00FFFFFF,&HA0000000,&H00000000,"
+                      f"0,0,0,0,100,100,0,0,1,2,0,5,60,60,0,1")
     elif a.style == "cards":
         styles.append(f"Style: Cap,{font},{a.caption_size},&H00FFFFFF,&H00FFFFFF,&H90000000,&H00000000,"
                       f"0,0,0,0,100,100,0,0,1,3,0,5,250,250,0,1")
@@ -677,6 +792,9 @@ def build_ass(timed, total, a, out_path, cards=()):
                   f"-1,0,0,0,100,100,0,0,3,22,0,8,90,90,0,1")
     styles.append(f"Style: LT1,{font},70,{accent},{accent},&H00000000,&H00000000,-1,0,0,0,100,100,0,0,1,0,0,4,0,0,0,1")
     styles.append(f"Style: LT2,{font},50,&H00FFFFFF,&H00FFFFFF,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,4,0,0,0,1")
+    styles.append("Style: PromoTxt,Inter Medium,92,&H00FFFFFF,&H00FFFFFF,&H90000000,&H00000000,"
+                  "0,0,0,0,100,100,0,0,1,2,0,5,40,40,0,1")
+    styles.append("Style: Ring,Arial,10,&HFF000000,&HFF000000,&H003539E5,&H00000000,0,0,0,0,100,100,0,0,1,6,0,5,0,0,0,1")
     styles.append("Style: CardTxt,Poppins SemiBold,118,&H00FFFFFF,&H00FFFFFF,&H70000000,&H60000000,"
                   "0,0,0,0,100,100,0,0,1,2,5,5,40,40,0,1")
     styles.append("Style: Box,Arial,10,&H40000000,&H40000000,&H00000000,&H00000000,0,0,0,0,100,100,0,0,1,0,0,7,0,0,0,1")
@@ -710,6 +828,35 @@ def build_ass(timed, total, a, out_path, cards=()):
                     t = t.upper()
                 texts.append(ass_escape(t))
             pos = f"\\an5\\pos({cx},{cap_y})"
+            if a.style == "promo":
+                emph = getattr(a, "emph_map", {})
+                kinds = [emph.get(x["i"], "") for x in c]
+                size = a.caption_size
+                for j in range(len(c)):
+                    s_ = c[0]["s"] if j == 0 else c[j]["s"]
+                    e_ = c[j + 1]["s"] if j + 1 < len(c) else end
+                    if e_ <= s_:
+                        continue
+                    parts = []
+                    for q, (txt, kd) in enumerate(zip(texts, kinds)):
+                        w_ = promo_word(txt, kd, size)
+                        parts.append(w_ if q <= j else f"{{\\alpha&HFF&}}{w_}{{\\alpha&H00&}}")
+                    lines.append(f"Dialogue: 1,{ass_time(s_)},{ass_time(e_)},Cap,,0,0,0,,{{{pos}\\q2\\blur2}}"
+                                 + " ".join(parts))
+                # red hand-drawn ring around 'circle' words
+                if "circle" in kinds:
+                    space = measure_text("a a", "Inter Medium", size)[0] - measure_text("aa", "Inter Medium", size)[0]
+                    widths = [promo_word_width(t_, k_, size) for t_, k_ in zip(texts, kinds)]
+                    total_w = sum(widths) + space * (len(widths) - 1)
+                    x = cx - total_w / 2
+                    for q, (wdt, kd) in enumerate(zip(widths, kinds)):
+                        if kd == "circle":
+                            xc, rx, ry = int(x + wdt / 2), int(wdt / 2 + 26), int(size * 0.62)
+                            lines.append(f"Dialogue: 2,{ass_time(c[q]['s'])},{ass_time(end)},Ring,,0,0,0,,"
+                                         f"{{\\an5\\pos({xc},{cap_y + 4})\\frz-5\\fscx70\\fscy70"
+                                         f"\\t(0,220,\\fscx100\\fscy100)\\fad(120,0)\\p1}}{ellipse_path(rx, ry)}")
+                        x += wdt + space
+                continue
             if a.style in ("podcast", "cards"):
                 lines.append(f"Dialogue: 1,{ass_time(c[0]['s'])},{ass_time(end)},Cap,,0,0,0,,"
                              f"{{{pos}\\q2\\blur3}}" + " ".join(texts))
@@ -936,6 +1083,12 @@ def cmd_render(a):
     run(["ffmpeg", "-y", "-hide_banner", "-f", "concat", "-safe", "0", "-i", os.path.join(segdir, "list.txt"),
          "-c", "copy", joined])
 
+    a.emph_map = {}
+    for item in filter(None, (a.emph or "").split(",")):
+        m = re.fullmatch(r"\s*[Ww]?(\d+)=(serif|bold|circle)\s*", item)
+        if not m:
+            die(f"--emph items look like w23=serif / w40=bold / w55=circle, got {item!r}")
+        a.emph_map[int(m.group(1))] = m.group(2)
     cards = parse_cards(a.cards, timed, data["lines"])
     build_ass(timed, total, a, os.path.join(wd, "captions.ass"), cards)
     name = os.path.splitext(os.path.basename(src))[0]
@@ -954,7 +1107,14 @@ def cmd_render(a):
     # cards: grid background over everything (incl. b-roll), photos on top, text via ASS
     if cards:
         # background per card: card["bg"] > --card-bg > generated grid paper. Video bgs loop.
-        default_bg = a.card_bg or make_grid_bg(os.path.join(wd, "card_bg.png"))
+        default_bg = a.card_bg or (make_blue_bg(os.path.join(wd, "promo_bg.png")) if a.style == "promo"
+                                   else make_grid_bg(os.path.join(wd, "card_bg.png")))
+        # split cards: keep the speaker visible in the bottom half
+        splits = [cd for cd in cards if cd.get("split")]
+        if splits:
+            fc.append(f"{last}split[spa][spb]")
+            fc.append(f"[spb]crop={W}:{H // 2}:0:{a.split_crop_y}[spk]")
+            last = "[spa]"
         groups = {}
         for cd in cards:
             bgp = os.path.abspath(os.path.expanduser(cd.get("bg") or default_bg))
@@ -972,6 +1132,10 @@ def cmd_render(a):
                       f"fps={FPS},format=yuv420p,setsar=1[cbg{g}]")
             fc.append(f"{last}[cbg{g}]overlay=shortest=1:enable='{win}'[cardbg{g}]")
             last = f"[cardbg{g}]"
+        if splits:
+            win = "+".join(f"between(t,{cd['s']:.3f},{cd['e']:.3f})" for cd in splits)
+            fc.append(f"{last}[spk]overlay=x=0:y={H // 2}:enable='{win}'[splitv]")
+            last = "[splitv]"
         for k, cd in enumerate(c for c in cards if c.get("image")):
             idx = inputs.count("-i")
             inputs += ["-loop", "1", "-framerate", str(FPS), "-i", cd["image"]]
@@ -1108,7 +1272,7 @@ def main():
 
     def r_args(sp):
         sp.add_argument("--style", choices=sorted(STYLES), default="podcast",
-                        help="podcast (default), cards (grid-paper text cards, lowercase Poppins) or bold (Hormozi)")
+                        help="podcast (default), cards (grid-paper text cards), promo (motion-ad look) or bold (Hormozi)")
         sp.add_argument("--hook", default="", help="on-screen hook; use | to choose the line break")
         sp.add_argument("--hook-duration", type=float, default=None)
         sp.add_argument("--hook-y", type=int, default=None)
@@ -1128,6 +1292,8 @@ def main():
         sp.add_argument("--lower-start", type=float, default=4.0)
         sp.add_argument("--lower-duration", type=float, default=4.0)
         sp.add_argument("--lower-y", type=int, default=1335)
+        sp.add_argument("--emph", default="", help="promo captions: w23=serif,w40=bold,w55=circle")
+        sp.add_argument("--split-crop-y", type=int, default=150, help="split cards: top of the speaker crop")
         sp.add_argument("--card-bg", default="", help="background for cards: image or (looping) video")
         sp.add_argument("--cards", default="", help="cards.json with full-screen text/photo cards (see SKILL.md)")
         sp.add_argument("--broll", default="", help="cutaways: w60-65=gym.mp4,L4=seminar.mov@1.5 (@ = start offset in the clip)")
