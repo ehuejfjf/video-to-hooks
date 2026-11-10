@@ -848,6 +848,34 @@ def cmd_preview(a):
     print("Red = Instagram UI overlays. Captions, hook and face should sit outside red.")
 
 
+# ------------------------------------------------------------------------------- fix
+
+
+def cmd_fix(a):
+    """Correct mis-heard words in the transcript (captions use the corrected text)."""
+    wd = workdir(a.video)
+    path = os.path.join(wd, "words.json")
+    if not os.path.exists(path):
+        die("run `transcribe` first")
+    data = load(path)
+    for item in a.fixes:
+        m = re.fullmatch(r"[Ww]?(\d+)=(.*)", item)
+        if not m:
+            die(f"use w<index>=<text>, got '{item}'")
+        i, text = int(m.group(1)), m.group(2)
+        if not 0 <= i < len(data["words"]):
+            die(f"no word w{i}")
+        old = data["words"][i]["w"]
+        # keep trailing punctuation unless the fix supplies its own
+        tail = re.search(r"[.,!?;:]+$", old)
+        if tail and not re.search(r"[.,!?;:]$", text):
+            text += tail.group(0)
+        data["words"][i]["w"] = text
+        print(f"w{i}: {old!r} -> {text!r}")
+    save(path, data)
+    write_transcript(wd, data["words"], data["lines"])
+
+
 # ------------------------------------------------------------------------------ auto
 
 
@@ -926,6 +954,7 @@ def main():
     sp = sub.add_parser("plan"); sp.add_argument("video"); p_args(sp)
     sp = sub.add_parser("render"); sp.add_argument("video"); r_args(sp)
     sp = sub.add_parser("preview"); sp.add_argument("video"); sp.add_argument("--frames", type=int, default=12)
+    sp = sub.add_parser("fix"); sp.add_argument("video"); sp.add_argument("fixes", nargs="+", help="w265=occupying")
     sp = sub.add_parser("auto"); sp.add_argument("video"); t_args(sp); p_args(sp); r_args(sp)
     sp.add_argument("--frames", type=int, default=12)
 
@@ -933,7 +962,7 @@ def main():
     if not os.path.exists(a.video):
         die(f"no such file: {a.video}")
     {"transcribe": cmd_transcribe, "plan": cmd_plan, "render": cmd_render,
-     "preview": cmd_preview, "auto": cmd_auto}[a.cmd](a)
+     "preview": cmd_preview, "fix": cmd_fix, "auto": cmd_auto}[a.cmd](a)
 
 
 if __name__ == "__main__":

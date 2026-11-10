@@ -72,6 +72,10 @@ applied per shot — hides jump cuts; `1.0` disables), `--keep-fillers`.
 Read the generated `edit.txt` (each kept segment with its text and duration) and check that the
 story reads cleanly start to finish. Re-run `plan` with a different `--drop` until it does.
 
+Whisper sometimes mishears words ("accompanying" for "occupying"). When the user points one out,
+or a word looks wrong in context, fix it before rendering:
+`python3 SKILL_DIR/scripts/reel.py fix "VIDEO" w265=occupying` (find the index in `words.json`).
+
 ## 3. Write hooks + caption
 
 Follow `SKILL_DIR/reference/hooks-and-caption.md` (the creator's house prompt) and write the
