@@ -1,5 +1,17 @@
-import json, subprocess, numpy as np, sys, difflib
-sys.path.insert(0,'/home/user/video-to-hooks/.claude/skills/reel-edit/scripts'); import reel
+#!/usr/bin/env python3
+"""Verify a render: loudness at every hard cut (should be < -30 dB) and a re-transcription diff.
+
+Usage: python3 cutcheck.py <work_dir> <final.mp4>
+"""
+import difflib
+import json
+import os
+import subprocess
+import sys
+
+import numpy as np
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import reel  # noqa: E402
 work, out = sys.argv[1], sys.argv[2]
 w=json.load(open(f'{work}/words.json')); e=json.load(open(f'{work}/render_edl.json'))
 t,total=reel.timed_words(w['words'],e)
